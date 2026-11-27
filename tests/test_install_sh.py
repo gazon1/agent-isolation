@@ -194,6 +194,46 @@ class SymlinkGuardTest(unittest.TestCase):
         self.assertNotIn('Traceback', result.stderr)
 
 
+class BuildTrustTest(unittest.TestCase):
+    """Root must never execute a build backend from the checkout (issue #5).
+
+    Measured: `uv tool install .` runs the project's build backend, and a malicious
+    hatch hook wrote a file. Under sudo that hook would run as ROOT.
+    """
+
+    def setUp(self):
+        self.text = INSTALL_SH.read_text(encoding='utf-8')
+
+    def test_root_installs_only_a_prebuilt_wheel(self):
+        """`--no-build` is what makes a source tree unacceptable to root."""
+        install = self.text.index('"$UV" tool install')
+        segment = self.text[install:install + 400]
+        self.assertIn('--no-build', segment)
+        self.assertIn('"$WHEEL"', segment, 'the artifact, not the checkout')
+        self.assertNotIn('"$SOURCE"', segment, 'the checkout must never be the install arg')
+
+    def test_the_wheel_is_built_as_the_calling_user(self):
+        self.assertIn('runuser -u "$BUILD_USER"', self.text)
+        self.assertIn('build --wheel --out-dir "$WORK" "$SOURCE"', self.text)
+        # The build directory must be writable by that user.
+        self.assertIn('chown "$BUILD_USER" "$WORK"', self.text)
+
+    def test_refuses_when_it_cannot_switch_to_the_caller(self):
+        """Failing closed matters more than installing: root must not build."""
+        self.assertIn('refusing to build as root', self.text)
+
+    def test_the_requirements_come_from_the_wheel_not_the_checkout(self):
+        """The manifest root reads must be the same artifact it installs."""
+        galaxy = self.text.index('collection install')
+        segment = self.text[max(0, galaxy - 300):galaxy + 300]
+        self.assertIn('-r "$WORK/requirements.yml"', segment)
+        self.assertNotIn('-r "$SOURCE', segment, 'the checkout must not supply the manifest')
+
+    def test_a_root_shell_cannot_run_it_without_a_caller(self):
+        """`sudo` provides SUDO_USER; a bare root shell has no unprivileged builder."""
+        self.assertIn('if [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ]', self.text)
+
+
 class ToolTrustTest(unittest.TestCase):
     """Every binary the installer runs AS ROOT is checked, not just the code."""
 
@@ -219,6 +259,33 @@ class ToolTrustTest(unittest.TestCase):
         self.assertIn(probe, self.text)
         older = "bin/python\" -E -c 'import agent_isolation"
         self.assertNotIn(older, self.text)
+
+
+class UpgradeSafetyTest(unittest.TestCase):
+    """A failed upgrade must not leave the host without a working install."""
+
+    def setUp(self):
+        self.text = INSTALL_SH.read_text(encoding='utf-8')
+
+    def test_the_build_happens_before_the_installed_tree_is_touched(self):
+        build = self.text.index('build --wheel --out-dir "$WORK"')
+        install = self.text.index('"$UV" tool install')
+        self.assertLess(build, install, 'a build failure leaves the old install alone')
+
+    def test_a_failed_build_aborts_before_any_install(self):
+        refusal = self.text.index('refusing to build as root')
+        next_install = self.text.index('"$UV" tool install')
+        self.assertLess(refusal, next_install)
+
+    def test_uninstall_removes_both_paths(self):
+        self.assertIn('rm -f "$BIN"', self.text)
+        self.assertIn('rm -rf "$LIB"', self.text)
+
+    def test_uninstall_refuses_a_foreign_installed_tree(self):
+        """Uninstall is root too: it must not remove a tree somebody else owns."""
+        uninstall = self.text.index('if [ "$UNINSTALL" = yes ]')
+        segment = self.text[uninstall:uninstall + 200]
+        self.assertIn('assert_trusted "$LIB" "$BIN"', segment)
 
 
 if __name__ == '__main__':

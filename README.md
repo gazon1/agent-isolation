@@ -45,14 +45,23 @@ That installs, **root-owned and outside any project checkout**:
 | `/usr/local/lib/agent-isolation/collections/` | the `ansible.posix` collection the playbook imports |
 | `/usr/local/bin/agent-account` | the CLI, a symlink into that venv |
 
-The install is a **copy**: `uv tool install` builds a wheel and unpacks it into the venv,
-so the checkout is never linked into what root executes. Delete or modify the checkout
-afterwards and `apply` still runs the same installed code.
+The install is a **copy**, and it is built **without root**. `install.sh` builds the
+wheel as the invoking user, then root installs that prebuilt artifact with `--no-build`.
+A malicious build backend in the checkout therefore never executes with root privileges —
+measured: a hatch hook planted in `pyproject.toml` runs as the calling user, never as root.
+
+The checkout is never linked into what root executes. Delete or modify it afterwards and
+`apply` still runs the same installed code.
+
+What this does **not** fix: the wheel is built from the checkout by the developer's own
+account, so whoever can write the checkout can influence the installed code. That is
+developer-level access, not root. For a fully trusted artifact, build on a trusted machine
+and install that wheel.
 
 Verify the layout without touching the host:
 
 ```console
-$ /usr/local/lib/agent-isolation/agent-isolation/bin/python -E -c 'import agent_isolation; print(agent_isolation.__file__)'
+$ /usr/local/lib/agent-isolation/agent-isolation/bin/python -I -c 'import agent_isolation; print(agent_isolation.__file__)'
 $ agent-account --help
 ```
 
@@ -112,6 +121,12 @@ agent-account [OPTIONS] rollback [ROOTS...]
 
 Exit codes: `0` every invariant holds, `1` at least one does not, `2` usage or error.
 
+There is deliberately **no** option to point the tool at another Ansible, another
+collection directory, or a `PYTHONPATH`. An Ansible collection is Python code, and the
+privileged half resolves both from its own installation: `--ansible-collections` (or an
+`ANSIBLE_COLLECTIONS_PATH` in the environment) would otherwise be a way to make root
+import code from a writable directory.
+
 **Nothing host-specific is assumed.** The Singularity consumer passes
 `--agent-group sing-dev --sdk-dir Android/Sdk --toolchain .local/share/mise
 --toolchain .local/bin`; a plain host passes none of them and gets the account, the
@@ -119,7 +134,7 @@ worktree grants and the sudoers rule alone.
 
 ### Compatibility
 
-- **Python ≥ 3.11**, Linux with ACL support. SELinux is *queried* by `check`, not configured.
+- **Python ≥ 3.12** (the pinned `ansible-core` requires it), Linux with ACL support. SELinux is *queried* by `check`, not configured.
 - The journal in `/var/lib/agent-account` is read by shape: a state file written by the
   pre-extraction `sing` script is still understood, so a host can be adopted without
   re-provisioning.

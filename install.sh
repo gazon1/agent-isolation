@@ -102,17 +102,76 @@ assert_trusted "$PREFIX/lib" "$PREFIX/bin" "$LIB"
 # because the caller's umask must not be able to loosen it.
 install -d -m 0755 -o root -g root "$LIB"
 
-# `uv tool install` builds a wheel and unpacks it into a venv under this directory,
-# so the installed tree is a COPY: the checkout is not linked into it, and
-# modifying or removing the checkout afterwards changes nothing.
-echo "Installing the tool into $LIB ..."
-# `--python /usr/bin/python3` and not `3.12`: naming a version lets uv resolve it to
-# a download under `~/.local/share/uv/python`, owned by the calling user. The
-# interpreter root executes has to come from root's own system.
+# -- build as the INVOKING user, install as root -------------------------------
+#
+# Measured: `uv tool install .` runs the project's build backend, and a malicious
+# hook in the checkout wrote a file as the invoking user. Under `sudo` that hook
+# would run as ROOT — the escalation this install exists to prevent.
+#
+# So the build is done by the unprivileged caller and root only ever installs a
+# PREBUILT WHEEL with `--no-build`: no build backend, no setup.py, no hatch hook
+# from the checkout is executed with root privileges.
+#
+# The residual assumption is stated rather than hidden: the wheel is built from the
+# checkout by the developer's own account, so an agent that can write the checkout
+# can influence the code that gets installed. That is developer-level access, which
+# such an agent already has; it is not root. Do not install from a checkout an
+# agent can write if that matters — build elsewhere and pass the wheel.
+if [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ]; then
+    echo "install.sh: run this through sudo, so the build runs as you and not as root" >&2
+    echo "            (sudo ./install.sh)" >&2
+    exit 1
+fi
+BUILD_USER=${SUDO_USER:-$(id -un)}
+
+# The builder runs as the CALLER and must be able to write its output here, so the
+# directory is owned by that user. `mktemp -d` alone is 0700 root, which made the
+# build fail with a bare "failed" — measured.
+WORK=$(mktemp -d)
+chown "$BUILD_USER" "$WORK"
+chmod 0755 "$WORK"
+# shellcheck disable=SC2064
+trap "rm -rf '$WORK'" EXIT INT TERM
+
+echo "Building the wheel as $BUILD_USER (no root code execution) ..."
+# `runuser` first: it does not prompt (we are root) and it preserves the
+# environment the builder needs. `su` is the fallback on systems without it; it
+# asks for a password when it cannot switch silently, which fails closed here.
+if ! runuser -u "$BUILD_USER" -- "$UV" build --wheel --out-dir "$WORK" "$SOURCE" >/dev/null 2>&1; then
+    if ! su -s /bin/sh "$BUILD_USER" -c "'$UV' build --wheel --out-dir '$WORK' '$SOURCE'" >/dev/null 2>&1; then
+        echo "install.sh: the unprivileged build failed; refusing to build as root" >&2
+        exit 1
+    fi
+fi
+WHEEL=$(ls "$WORK"/agent_isolation-*.whl 2>/dev/null | head -1)
+if [ -z "$WHEEL" ]; then
+    echo "install.sh: no wheel was produced in $WORK" >&2
+    exit 1
+fi
+echo "  built $(basename "$WHEEL") ($(sha256sum "$WHEEL" | cut -c1-16)...)"
+
+# The requirements come from the SAME artifact, not from the checkout.
+/usr/bin/python3 - "$WHEEL" "$WORK/requirements.yml" <<'PYEOF'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    with z.open('agent_isolation/ansible/requirements.yml') as src:
+        open(sys.argv[2], 'wb').write(src.read())
+PYEOF
+
+# `--no-build`: the ONLY thing root accepts is a prebuilt wheel and cached wheels
+# of the dependencies. `agent-isolation` itself is never built here.
+#
+# `--exclude-newer` pins the DEPENDENCY RESOLUTION to the moment this commit was
+# cut, so two installs of the same source agree even if an index re-tags a package
+# in between. `uv.lock` is the authoritative pin; this is the belt around it that
+# works for a wheel (which does not carry the lock).
+EXCLUDE_AFTER=${AGENT_ISOLATION_EXCLUDE_NEWER:-2026-11-28T00:00:00Z}
 UV_TOOL_DIR="$LIB" UV_TOOL_BIN_DIR="$LIB/bin-dir" "$UV" tool install \
     --python /usr/bin/python3 \
+    --no-build \
+    --exclude-newer "$EXCLUDE_AFTER" \
     --force \
-    "$SOURCE"
+    "$WHEEL"
 
 ln -sfn "$LIB/bin-dir/agent-account" "$BIN"
 
@@ -120,7 +179,7 @@ ln -sfn "$LIB/bin-dir/agent-account" "$BIN"
 # elevated playbook never reads one from a user home or a checkout.
 echo "Installing Ansible collections into $LIB/collections ..."
 "$LIB/agent-isolation/bin/ansible-galaxy" collection install \
-    -r "$SOURCE/src/agent_isolation/ansible/requirements.yml" \
+    -r "$WORK/requirements.yml" \
     -p "$LIB/collections" \
     --force
 

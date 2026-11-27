@@ -34,7 +34,9 @@ What is pinned here, in the order the suite reads:
 import importlib.util
 import io
 import pathlib
+import shutil
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -1226,13 +1228,14 @@ class ElevateTest(Base):
         self.assertEqual(0, out.returncode, out.stderr)
         self.assertIn('Usage:', out.stdout, 'the installed module imported under -I')
 
-    def test_the_elevated_command_carries_what_root_cannot_find(self):
-        """Measured: neither Ansible nor its collection path is on root's
-        secure_path or HOME, so both travel with the command."""
+    def test_the_elevated_command_carries_no_ansible_path(self):
+        """Reversed on purpose. Ansible used to travel as a caller-resolved flag;
+        that was a root execution primitive (a collection directory is Python code),
+        so the privileged half now resolves both from its own installation."""
         ctx = self.context()
         command = aa.reexec_command(ctx.cfg, 'apply')
-        self.assertIn(str(ctx.cfg.ansible_playbook), command)
-        self.assertIn(str(ctx.cfg.ansible_collections_path), command)
+        self.assertNotIn('--ansible-playbook', command)
+        self.assertNotIn('--ansible-collections', command)
         # `-I`, which IMPLIES `-E`: PYTHON* variables are ignored either way, but
         # `-E` alone leaves the working directory on sys.path. `-I` additionally
         # drops the USER site — not the interpreter's own venv, which is where
@@ -2034,160 +2037,104 @@ class ConfigTest(unittest.TestCase):
 
 
 class AnsibleResolutionTest(unittest.TestCase):
-    """Ansible is found by the UNPRIVILEGED caller: neither the binary nor the
-    collection path is on root's secure_path or HOME."""
+    """Ansible is resolved from the INSTALLATION, and nothing else.
 
-    def test_the_collections_path_falls_back_to_a_collections_directory(self):
-        """Under sudo, `ANSIBLE_HOME` is root's and the playbook cannot resolve
-        `ansible.posix.acl`; the path the caller saw is the one carried through."""
+    Every caller-supplied knob is gone on purpose (issue #5): an Ansible collection
+    directory carries Python modules and plugins, so a path the caller names is a
+    root execution primitive once `apply` re-executes as root.
+    """
+
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix='aa-ansible-'))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.venv = self.root / 'agent-isolation'
+        (self.venv / 'bin').mkdir(parents=True)
+        self.playbook_bin = self.venv / 'bin' / 'ansible-playbook'
+        self.playbook_bin.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+        self.playbook_bin.chmod(0o755)
+        self.collections = self.root / 'collections'
+        (self.collections / 'ansible_collections' / 'ansible' / 'posix').mkdir(parents=True)
+
+    def _resolve(self, prefix: pathlib.Path | None = None):
+        saved = aa.sys.prefix
+        try:
+            aa.sys.prefix = str(prefix or self.venv)
+            return aa.resolve_ansible()
+        finally:
+            aa.sys.prefix = saved
+
+    def test_both_paths_come_from_the_installation(self):
+        found, collections = self._resolve()
+        self.assertEqual(self.playbook_bin, found)
+        self.assertEqual(str(self.collections), collections)
+
+    def test_a_caller_supplied_collection_path_is_ignored(self):
+        """The measured attack: ANSIBLE_COLLECTIONS_PATH reached root as a flag."""
         import os
 
         saved = dict(os.environ)
         try:
-            os.environ.pop('ANSIBLE_COLLECTIONS_PATH', None)
-            _, collections = aa.resolve_ansible(pathlib.Path('/usr/bin/true'))
-            self.assertIn('collections', collections)
-            self.assertTrue(collections.endswith(('.ansible/collections:/usr/share/ansible/collections',))
-                            or ':collections' in collections)
+            os.environ['ANSIBLE_COLLECTIONS_PATH'] = '/tmp/evil-collections'
+            _, collections = self._resolve()
         finally:
             os.environ.clear()
             os.environ.update(saved)
+        self.assertEqual(str(self.collections), collections,
+                         'an environment path must not influence the privileged run')
 
-    def test_a_missing_ansible_is_a_refusal_before_anything_runs(self):
-        """The binary comes from the INSTALLATION, so its absence is a broken
-        install — not a PATH to go hunting in. The error says which file."""
-        saved_prefix = aa.sys.prefix
+    def test_there_is_no_way_to_name_a_playbook_or_collections(self):
+        """Pinned by shape: the parameters themselves must not come back."""
+        source = pathlib.Path(aa.__file__).read_text(encoding='utf-8')
+        self.assertIn('def resolve_ansible() -> tuple[Path, str]:', source)
+        self.assertNotIn('os.environ.get("ANSIBLE_COLLECTIONS_PATH"', source,
+                         'the environment must never supply the path')
+        self.assertIn('env["ANSIBLE_COLLECTIONS_PATH"] = self.cfg.ansible_collections_path', source,
+                      'the installation path is still EXPORTED to the playbook')
+        # The names survive in the docstring explaining WHY they are gone; what must
+        # not survive is any code that declares or forwards them.
+        self.assertNotIn('click.option(\n            "--ansible-playbook"', source)
+        self.assertNotIn('"--ansible-playbook", str(', source, 'no forwarding in the re-exec')
+        self.assertNotIn('"--ansible-collections", cfg.', source, 'no forwarding in the re-exec')
+
+    def test_a_skipped_install_is_a_refusal_not_a_silent_guess(self):
+        """No collections beside the venv means the install is incomplete."""
+        bare_root = pathlib.Path(tempfile.mkdtemp(prefix='aa-bare-'))
+        self.addCleanup(shutil.rmtree, bare_root, True)
+        bare = bare_root / 'agent-isolation'
+        (bare / 'bin').mkdir(parents=True)
+        (bare / 'bin' / 'ansible-playbook').write_text('#!/bin/sh\n', encoding='utf-8')
+        (bare / 'bin' / 'ansible-playbook').chmod(0o755)
+        saved = aa.sys.prefix
         try:
-            aa.sys.prefix = '/nonexistent-install'
+            aa.sys.prefix = str(bare)
             with self.assertRaises(aa.AgentAccountError) as caught:
-                aa.resolve_ansible(None)
-            self.assertIn('reinstall the tool', str(caught.exception))
-            self.assertIn('ansible-playbook', str(caught.exception))
+                aa.resolve_ansible()
         finally:
-            aa.sys.prefix = saved_prefix
+            aa.sys.prefix = saved
+        self.assertIn('reinstall the tool', str(caught.exception))
 
-    def test_a_hostile_path_cannot_name_the_privileged_binary(self):
-        """A hostile PATH must not be able to name the binary that runs as root.
-
-        The resolution never consults PATH at all; this pins that by pointing it at
-        a decoy and proving the answer comes from the installation.
-        """
-        import os
-        import shutil as sh
-
-        saved = dict(os.environ)
-        saved_which = sh.which
+    def test_a_missing_ansible_binary_is_a_refusal_before_anything_runs(self):
+        saved = aa.sys.prefix
         try:
-            sh.which = lambda name, *a, **k: '/tmp/decoy/ansible-playbook'
-            found = aa.trusted_bin('python')
-            self.assertTrue(str(found).startswith(str(aa.sys.prefix)), found)
-            self.assertNotEqual(pathlib.Path('/tmp/decoy/ansible-playbook'), found)
+            aa.sys.prefix = str(self.root / 'absent')
+            with self.assertRaises(aa.AgentAccountError) as caught:
+                aa.resolve_ansible()
         finally:
-            sh.which = saved_which
-            os.environ.clear()
-            os.environ.update(saved)
+            aa.sys.prefix = saved
+        self.assertIn('ansible-playbook', str(caught.exception))
+        self.assertIn('reinstall the tool', str(caught.exception))
 
-    def test_the_default_ansible_never_consults_the_path(self):
-        """PATH is caller-controlled, so a lookup there IS the vulnerability.
-
-        Asserted by making the lookup raise: any call is the failure, which cannot
-        pass by accident the way "the decoy was not chosen" can.
-        """
-        import shutil as sh
-
+    def test_the_binary_is_never_looked_up_on_the_path(self):
+        """PATH is caller-controlled, so a lookup there is the vulnerability."""
         def forbidden(*args, **kwargs):
             raise AssertionError('resolve_ansible consulted the PATH')
 
-        saved = sh.which
+        saved = shutil.which
         try:
-            sh.which = forbidden
-            try:
-                found, _ = aa.resolve_ansible(None)
-            except aa.AgentAccountError as error:
-                # Not installed under this interpreter (a bare source tree): the
-                # refusal is still proof that PATH was never asked.
-                self.assertIn('reinstall the tool', str(error))
-                return
+            shutil.which = forbidden
+            self._resolve()
         finally:
-            sh.which = saved
-        self.assertTrue(str(found).startswith(str(aa.sys.prefix)), found)
-
-    def test_the_collections_come_from_the_installation_not_somebody_s_HOME(self):
-        """Measured on the live install: `ansible-playbook --version` reports the
-        collections path under the CALLER's HOME, so `apply` (root, HOME=/root)
-        failed to resolve ansible.posix.acl while `--dry-run` passed.
-
-        A path that changes with whose HOME asked is not an installed path.
-        """
-        import tempfile
-
-        root = pathlib.Path(tempfile.mkdtemp(prefix='aa-colls-'))
-        self.addCleanup(__import__('shutil').rmtree, root, True)
-        # Shape of the real install: <prefix>/agent-isolation (venv) + <prefix>/collections
-        venv = root / 'agent-isolation'
-        (venv / 'bin').mkdir(parents=True)
-        fake = venv / 'bin' / 'ansible-playbook'
-        fake.write_text('#!/bin/sh\necho "  collections path = /home/somebody/.ansible/collections"\n',
-                        encoding='utf-8')
-        fake.chmod(0o755)
-        (root / 'collections' / 'ansible_collections').mkdir(parents=True)
-
-        saved_prefix = aa.sys.prefix
-        try:
-            aa.sys.prefix = str(venv)
-            _, collections = aa.resolve_ansible(fake)
-        finally:
-            aa.sys.prefix = saved_prefix
-        self.assertEqual(str(root / 'collections'), collections,
-                         'the installed collections win over HOME-derived output')
-
-    def test_the_privileged_module_path_is_the_package(self):
-        """`-m agent_isolation` and not a filesystem path: pip/uv model of trust."""
-        source = pathlib.Path(aa.__file__).read_text(encoding='utf-8')
-        self.assertIn('"-m", "agent_isolation"', source)
-        self.assertIn('"-I", "-m", "agent_isolation"', source)
-        self.assertNotIn('str(SELF_PATH)', source, 'the checkout path is no longer an argument')
-
-    def test_an_explicit_playbook_still_has_its_mise_shim_resolved(self):
-        """A consumer may pin its own Ansible. Measured: the shim run with root's
-        environment answers "not a valid shim", while the install path it names
-        runs — so the shim is traded for its target."""
-        import tempfile
-
-        tmp = pathlib.Path(tempfile.mkdtemp(prefix='aa-shim-'))
-        self.addCleanup(__import__('shutil').rmtree, tmp, True)
-        install = tmp / 'installs' / 'ansible-core' / '2.21.5' / 'bin'
-        install.mkdir(parents=True)
-        real = install / 'ansible-playbook'
-        real.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
-        real.chmod(0o755)
-        # The shim is `mise`, so it dispatches on argv[0] and must be asked BY PATH.
-        mise = tmp / 'mise'
-        mise.write_text(f'#!/bin/sh\necho "{real}"\n', encoding='utf-8')
-        mise.chmod(0o755)
-        shim = tmp / 'shims' / 'ansible-playbook'
-        shim.parent.mkdir()
-        shim.symlink_to(mise)
-
-        found, _ = aa.resolve_ansible(shim)
-        self.assertEqual(real, found, 'the shim must be traded for the binary it names')
-        self.assertNotEqual(mise, found, 'never collapse the shim to `mise` itself')
-
-    def test_a_shim_that_cannot_name_its_binary_falls_back_to_the_shim(self):
-        """A clearer error names the shim the reader installed, not a guess."""
-        import tempfile
-
-        tmp = pathlib.Path(tempfile.mkdtemp(prefix='aa-shim2-'))
-        self.addCleanup(__import__('shutil').rmtree, tmp, True)
-        mise = tmp / 'mise'
-        mise.write_text('#!/bin/sh\nexit 1\n', encoding='utf-8')
-        mise.chmod(0o755)
-        shim = tmp / 'ansible-playbook'
-        shim.symlink_to(mise)
-
-        found, _ = aa.resolve_ansible(shim)
-        self.assertEqual(shim, found)
-        self.assertNotEqual(mise, found, 'the shim must not be collapsed to `mise` itself')
+            shutil.which = saved
 
 
 # ---------------------------------------------------------------------------

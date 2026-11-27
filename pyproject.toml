@@ -2,12 +2,14 @@
 name = "agent-isolation"
 version = "0.1.0"
 description = "A dedicated unprivileged host account for coding agents, with ACLs, a journal and rollback."
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 readme = "README.md"
 dependencies = [
-  # Pinned: the elevated half imports these, so a floating version is a dependency
-  # the root half could get a different copy of than the plan it just computed.
+  # Constrained here and LOCKED in uv.lock: the elevated half imports these, so a
+  # floating version is a dependency the root half could get a different copy of
+  # than the plan it just computed. `install.sh` builds the wheel from the checkout
+  # but resolves against the lock, so two installs of one commit agree exactly.
   "click>=8.1,<9",
   "pydantic>=2.6,<3",
   # The declarative half's runner. It lives in THIS venv so `sudo` re-executes

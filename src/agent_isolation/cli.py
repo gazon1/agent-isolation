@@ -2484,10 +2484,6 @@ class Deps:
     geteuid: Callable[[], int] = os.geteuid
     state_dir: Path = DEFAULT_STATE_DIR
     sudoers_path: Path = DEFAULT_SUDOERS_PATH
-    # Resolved by the UNPRIVILEGED caller and carried through sudo: neither
-    # `ansible-playbook` nor the collection path is on root's secure_path/HOME.
-    ansible_playbook: Path | None = None
-    ansible_collections_path: str = ""
     #: The test seam: a fake declares nothing to Ansible and records the variables
     #: a real run would have handed the playbook.
     ansible_factory: Callable[["Config", Runner], "Ansible"] = Ansible
@@ -2524,86 +2520,32 @@ def trusted_bin(name: str) -> Path:
     return candidate
 
 
-def resolve_ansible(playbook: Path | None, explicit: str = "") -> tuple[Path, str]:
-    """Where Ansible is, resolved from the INSTALLATION before sudo drops the env.
+def resolve_ansible() -> tuple[Path, str]:
+    """Where Ansible and its collections are. Both come from the INSTALLATION.
 
-    Measured: under a root-like HOME the playbook fails with "couldn't
-    resolve module/action 'ansible.posix.acl'" because the default collection path
-    is `{{ ANSIBLE_HOME }}/collections`, and root's ANSIBLE_HOME is not the
-    installer's. Both are therefore resolved once, here, and carried through.
+    There is no `--ansible-playbook`, no `--ansible-collections` and no
+    `ANSIBLE_COLLECTIONS_PATH` here, and that is the fix rather than an omission
+    (issue #5). Measured: `ANSIBLE_COLLECTIONS_PATH=/tmp/evil
+    agent-account apply` reached root as `--ansible-collections /tmp/evil`, because
+    the value travelled from the unprivileged caller through the re-execution.
+
+    That is arbitrary code execution as root: Ansible collections carry Python
+    modules and plugins, so a collection directory under a writable path is a root
+    execution primitive. Ansible's own docs are explicit that the path is resolved
+    from the config placement, and `--version` reports the path under the CALLER's
+    HOME — which is also why the root half could not resolve `ansible.posix` at all
+    before the installation's own directory was used.
+
+    A consumer that needs a different Ansible installs it here.
     """
-    # `--ansible-playbook` stays as an explicit override for a consumer that pins
-    # its own Ansible, but the default is the installed one, not a PATH lookup.
-    found = Path(playbook) if playbook else trusted_bin("ansible-playbook")
-    collections = explicit or os.environ.get("ANSIBLE_COLLECTIONS_PATH", "")
-    if not collections:
-        # The installation's own collections first, and it is checked by shape
-        # rather than by asking Ansible. Measured: `ansible-playbook --version`
-        # reports the collections path under the CALLER's HOME
-        # (/home/max/.ansible/...), and the root half runs with HOME=/root — so
-        # `apply` as root died with "couldn't resolve module/action
-        # 'ansible.posix.acl'" while `--dry-run` (same HOME) passed. A path that
-        # depends on whose HOME asked is not an installed path.
-        installed = Path(sys.prefix).parent / "collections"
-        if (installed / "ansible_collections").is_dir():
-            collections = str(installed)
-    if not collections:
-        dumped = subprocess.run(
-            [str(found), "--version"], capture_output=True, text=True, check=False
-        ).stdout
-        match = re.search(r"^  collections path = (.*)$", dumped, re.MULTILINE)
-        if match:
-            collections = match.group(1).strip()
-    if not collections:
-        collections = f"{Path.home()}/.ansible/collections:/usr/share/ansible/collections"
-    return _unyielding(found), collections
-
-
-def _unyielding(found: Path) -> Path:
-    """The real binary behind a mise shim, because the shim needs mise's environment.
-
-    Measured: `/home/max/.local/share/mise/shims/ansible-playbook` run with root's
-    environment (no MISE_*, HOME=/root) answers "ansible-playbook is not a valid
-    shim … Run `mise use <TOOL>`", while
-    `~/.local/share/mise/installs/ansible-core/<v>/bin/ansible-playbook` runs and
-    reports its version. The shim is a launcher for the developer's shell; the root
-    half is not that shell.
-
-    `mise which` is the supported way to ask, and it answers with the install path
-    for exactly the version this checkout pins. A plain binary is returned as is,
-    and so is a shim whose target cannot be determined — the error then names the
-    shim, which is more use than a guess.
-    """
-    resolved = found.resolve()
-    if resolved.name != "mise":
-        return found.absolute()
-    try:
-        # `resolved` is `mise` itself, and it has to be: a shim dispatches on
-        # argv[0], so running the SHIM as `mise which …` becomes
-        # `ansible-playbook which …` — measured as "the playbook: which could not
-        # be found".
-        asked = subprocess.run(
-            [str(resolved), "which", "ansible-playbook"], capture_output=True, text=True, check=False
+    found = trusted_bin("ansible-playbook")
+    collections = Path(sys.prefix).parent / "collections"
+    if not (collections / "ansible_collections").is_dir():
+        raise AgentAccountError(
+            f"{collections}/ansible_collections is missing — the installation is incomplete; "
+            "reinstall the tool (install.sh installs ansible.posix there)"
         )
-    except OSError:
-        return found.absolute()
-    answer = asked.stdout.strip()
-    if asked.returncode == 0 and answer and Path(answer).is_file():
-        return Path(answer)
-    return found.absolute()
-
-
-def _with_ansible(deps: Deps, playbook: Path | None, collections: str | None) -> Deps:
-    """Carry the caller-resolved Ansible paths onto the deps the verb sees.
-
-    Both are optional: without them `resolve_ansible` locates Ansible on the
-    caller's PATH and reads the collection path out of `ansible-playbook`.
-    """
-    if playbook:
-        deps.ansible_playbook = Path(playbook)
-    if collections:
-        deps.ansible_collections_path = collections
-    return deps
+    return found, str(collections)
 
 
 def make_context(
@@ -2619,7 +2561,7 @@ def make_context(
     allow_in_home: bool = False,
 ) -> Context:
     name, home = resolve_dev(deps.accounts, dev)
-    playbook, collections = resolve_ansible(deps.ansible_playbook, deps.ansible_collections_path)
+    playbook, collections = resolve_ansible()
     try:
         cfg = Config(
             agent_user=agent_user,
@@ -2663,8 +2605,6 @@ def reexec_command(cfg: Config, verb: str) -> list[str]:
         "--dev", cfg.dev_name,
         "--agent-user", cfg.agent_user,
         "--agent-group", cfg.agent_group,
-        "--ansible-playbook", str(cfg.ansible_playbook),
-        "--ansible-collections", cfg.ansible_collections_path,
     ]  # fmt: skip
     if cfg.sdk_dir_rel:
         argv += ["--sdk-dir", cfg.sdk_dir_rel]
@@ -2707,14 +2647,6 @@ def agent_options(command: Callable) -> Callable:
             "--toolchain", "toolchain_rels", multiple=True, envvar="AGENT_TOOLCHAIN",
             metavar="REL", help="A read-only toolchain directory, relative to the developer's home. Repeatable.",
         ),
-        click.option(
-            "--ansible-playbook", type=click.Path(path_type=Path), default=None,
-            help="The ansible-playbook binary. Default: the one in this installation.",
-        ),
-        click.option(
-            "--ansible-collections", default=None,
-            help="Ansible collections search path. Default: ansible-playbook's own, resolved before sudo.",
-        ),
     ]  # fmt: skip
     for option in reversed(options):
         command = option(command)
@@ -2747,14 +2679,12 @@ def cli(ctx: click.Context) -> None:
 @roots_argument
 @click.pass_obj
 def apply(deps: Deps, dry_run: bool, allow_in_home: bool, roots: tuple[Path, ...],
-         ansible_playbook: Path | None, ansible_collections: str | None,
          **identity: object) -> None:
     """Create or reconcile the account and authorize the worktree ROOTS.
 
     Needs root: re-executes itself through sudo, so there is one password prompt and
     the plan cannot drift from what runs.
     """
-    deps = _with_ansible(deps, ansible_playbook, ansible_collections)
     ctx = make_context(deps, roots=roots, dry_run=dry_run, allow_in_home=allow_in_home, **identity)
     ctx.require_unprivileged_uid()
     validate_roots(ctx)  # everything that can refuse, refuses before the first write
@@ -2769,10 +2699,8 @@ def apply(deps: Deps, dry_run: bool, allow_in_home: bool, roots: tuple[Path, ...
 @roots_argument
 @click.pass_obj
 def check(deps: Deps, roots: tuple[Path, ...],
-         ansible_playbook: Path | None, ansible_collections: str | None,
          **identity: object) -> None:
     """Print a verdict on every invariant. Needs no root."""
-    deps = _with_ansible(deps, ansible_playbook, ansible_collections)
     ctx = make_context(deps, roots=roots, **identity)
     click.get_current_context().exit(Checker(ctx).run())
 
@@ -2781,11 +2709,8 @@ def check(deps: Deps, roots: tuple[Path, ...],
 @agent_options
 @click.argument("command", nargs=-1, type=click.UNPROCESSED)
 @click.pass_obj
-def run(deps: Deps, command: tuple[str, ...],
-       ansible_playbook: Path | None, ansible_collections: str | None,
-         **identity: object) -> None:
+def run(deps: Deps, command: tuple[str, ...], **identity: object) -> None:
     """Run COMMAND as the agent (needs no root, gains none): run -- CMD [ARGS...]"""
-    deps = _with_ansible(deps, ansible_playbook, ansible_collections)
     ctx = make_context(deps, roots=(), **identity)
     # The invariant belongs on the verb that EXECUTES, not only on the one that
     # provisions: `run -- id` must not answer uid 0 — and must not start an agent
@@ -2801,10 +2726,8 @@ def run(deps: Deps, command: tuple[str, ...],
 @roots_argument
 @click.pass_obj
 def rollback(deps: Deps, dry_run: bool, roots: tuple[Path, ...],
-            ansible_playbook: Path | None, ansible_collections: str | None,
-         **identity: object) -> None:
+            **identity: object) -> None:
     """Undo what apply did, from the record it left. Needs root."""
-    deps = _with_ansible(deps, ansible_playbook, ansible_collections)
     ctx = make_context(deps, roots=roots, dry_run=dry_run, **identity)
     elevate(deps, ctx.cfg, "rollback")
     store = StateStore(ctx.cfg.state_dir, ctx.cfg.dry_run)
