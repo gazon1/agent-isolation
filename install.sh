@@ -37,34 +37,57 @@ done
 # The privileged half runs from here, so nothing may be owned by a non-root account
 # or be writable by one. Checked, not merely created: an attacker who pre-creates
 # the directory wins otherwise.
+#
+# EVERY component of a path is checked, not just the final entry. Measured: a
+# symlink `/tmp/writable-dir/uv -> /usr/bin/uv` was ACCEPTED, because the target is
+# root-owned and read-only — while the world-writable directory holding the link
+# lets any user re-point it between this check and the `exec` below. Same for a
+# custom PREFIX: `/tmp/prefix/lib` can pass while `/tmp/prefix` itself is writable.
+#
+# `readlink -f` canonicalises first, so a path is judged where it really lives —
+# but canonicalising alone is not enough, and that is the subtle part: for
+# `/tmp/writable-dir/uv -> /usr/bin/uv` it answers `/usr/bin/uv`, whose components
+# are all root-owned, while the DIRECTORY HOLDING THE LINK stays world-writable and
+# can re-point it at any moment between this check and the `exec`. So both the path
+# AS GIVEN and its canonical target are walked.
+#
+# This is check-then-use, and it is only as safe as the components being unwritable
+# by anyone but root — which is exactly what the walk establishes.
 assert_trusted() {
-    for path in "$@"; do
-        [ -e "$path" ] || continue
-        # A SYMLINK is followed: `stat` on a link reports 0777 on Linux whatever it
-        # points at, so checking the link itself refused every uninstall of our own
-        # `/usr/local/bin/agent-account`. What matters is the target, and whether
-        # the link sits in a directory somebody else can write (checked above).
-        if [ -L "$path" ]; then
-            owner=$(stat -L -c %u "$path")
-            perms=$(stat -L -c "%a" "$path")
-            if [ "$owner" -ne 0 ] || [ $((0$perms & 022)) -ne 0 ]; then
-                echo "install.sh: $path -> $(readlink -f "$path") is not root-owned and read-only" >&2
+    _walk() {
+        check=$1
+        while :; do
+            # `-L`: a DIRECTORY that is a symlink (/usr/sbin -> bin) reports 0777
+            # on the link itself, which would refuse every normal Fedora install —
+            # measured. The target is what the exec will traverse.
+            owner=$(stat -L -c %u "$check")
+            perms=$(stat -L -c "%a" "$check")
+            if [ "$owner" -ne 0 ]; then
+                echo "install.sh: $check is owned by uid $owner, not root — refusing to use it" >&2
                 exit 1
             fi
-            continue
-        fi
-        owner=$(stat -c %u "$path")
-        if [ "$owner" -ne 0 ]; then
-            echo "install.sh: $path is owned by uid $owner, not root — refusing to use it" >&2
+            # Group or world write is a path for a non-root user to replace the code
+            # root will execute. The sticky bit does not help: it stops deletion of
+            # entries the writer does not own, not re-pointing one it does.
+            if [ $((0$perms & 022)) -ne 0 ]; then
+                echo "install.sh: $check is group- or world-writable (mode $perms)" >&2
+                exit 1
+            fi
+            [ "$check" = "/" ] && break
+            check=$(dirname -- "$check")
+        done
+    }
+    for path in "$@"; do
+        [ -e "$path" ] || continue
+        # The path as given: catches a writable directory holding the entry.
+        _walk "$(case $path in /*) printf %s "$path" ;; *) printf %s "$PWD/$path" ;; esac)"
+        # Its real location: catches a writable ancestor behind a symlink.
+        canonical=$(readlink -f -- "$path")
+        if [ -z "$canonical" ]; then
+            echo "install.sh: cannot canonicalise $path" >&2
             exit 1
         fi
-        perms=$(stat -c "%a" "$path")
-        # Group or world write on a directory is a path for a non-root user to
-        # replace the code root will execute.
-        if [ $((0$perms & 022)) -ne 0 ]; then
-            echo "install.sh: $path is group- or world-writable (mode $perms)" >&2
-            exit 1
-        fi
+        _walk "$canonical"
     done
 }
 
@@ -158,18 +181,32 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         open(sys.argv[2], 'wb').write(src.read())
 PYEOF
 
+# THE LOCK IS THE RESOLUTION. A wheel carries RANGES (`click<9,>=8.1`), not
+# versions, so installing it alone re-resolves and can produce a different runtime
+# from the same commit. `uv export` turns the committed lock into exact pins and
+# `--constraints` makes the install honour them; a lock/range disagreement then
+# fails instead of silently drifting.
+#
+# Exported by the BUILDING user from the checkout, then read by root as data — it is
+# a list of `name==version` lines, not code.
+CONSTRAINTS="$WORK/constraints.txt"
+if ! runuser -u "$BUILD_USER" -- "$UV" export \
+        --project "$SOURCE" --format requirements-txt --no-hashes --no-emit-project \
+        > "$CONSTRAINTS" 2>/dev/null; then
+    echo "install.sh: cannot export the dependency lock; refusing to resolve freely" >&2
+    exit 1
+fi
+if [ ! -s "$CONSTRAINTS" ]; then
+    echo "install.sh: the exported lock is empty — is uv.lock committed?" >&2
+    exit 1
+fi
+
 # `--no-build`: the ONLY thing root accepts is a prebuilt wheel and cached wheels
 # of the dependencies. `agent-isolation` itself is never built here.
-#
-# `--exclude-newer` pins the DEPENDENCY RESOLUTION to the moment this commit was
-# cut, so two installs of the same source agree even if an index re-tags a package
-# in between. `uv.lock` is the authoritative pin; this is the belt around it that
-# works for a wheel (which does not carry the lock).
-EXCLUDE_AFTER=${AGENT_ISOLATION_EXCLUDE_NEWER:-2026-11-28T00:00:00Z}
 UV_TOOL_DIR="$LIB" UV_TOOL_BIN_DIR="$LIB/bin-dir" "$UV" tool install \
     --python /usr/bin/python3 \
     --no-build \
-    --exclude-newer "$EXCLUDE_AFTER" \
+    --constraints "$CONSTRAINTS" \
     --force \
     "$WHEEL"
 

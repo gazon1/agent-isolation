@@ -9,11 +9,20 @@
 
 THE PRIVILEGED HALF RUNS INSTALLED CODE
 
-`apply` and `rollback` re-execute `sudo -- <sys.executable> -E -m agent_isolation`,
+`apply` and `rollback` re-execute `sudo -- <sys.executable> -I -m agent_isolation`,
 and both the interpreter and the module come from `install.sh`'s root-owned venv.
-`ansible-playbook` and the collection path are resolved from that same installation.
-Nothing on the caller's PATH, and nothing in the caller's checkout, is executed with
-elevated privileges (agent-isolation #5).
+`ansible-playbook` and its collections are resolved from that same installation.
+
+`-I` (isolated) rather than `-E`: `-E` only ignores PYTHON* variables and leaves the
+CURRENT DIRECTORY on `sys.path`, so `-m agent_isolation` run from a directory holding
+a decoy package imports the decoy — as root. `-I` also drops the user site while
+keeping the interpreter's own venv, which is where the dependencies live.
+
+Nothing on the caller's PATH, nothing in the caller's checkout, and no caller-supplied
+Ansible or collection path is executed with elevated privileges (agent-isolation #5).
+There is no `--ansible-playbook`, no `--ansible-collections` and no
+`ANSIBLE_COLLECTIONS_PATH` input: a collection directory is Python code, so naming one
+would be a root execution primitive.
 
 WHY
 
@@ -76,19 +85,17 @@ reverse of each. This file owns everything Ansible cannot decide:
 
 PORTING NOTES
 
-  - The root half is re-executed as `sudo -- <sys.executable> -E <this file>`.
-    `-E` ignores PYTHON* variables. NOT `-I`: it also implies `-s` and drops the
-    user site, where a `pip install --user` pydantic lives — measured on this host
-    ("No module named 'pydantic'" from the root half). sudo's secure_path is never
-    consulted for the interpreter, and it is not consulted for `ansible-playbook`
-    either: both paths are resolved by the UNPRIVILEGED caller and passed through,
-    because a developer-installed Ansible is not on root's secure_path.
+  - The root half is re-executed as `sudo -- <sys.executable> -I -m agent_isolation`.
+    The interpreter is `sys.executable` — the installed venv, never a PATH lookup —
+    so sudo's secure_path is irrelevant and no developer-installed interpreter can
+    be substituted.
 
-  - `ANSIBLE_COLLECTIONS_PATH` is passed explicitly for the same reason. Measured:
-    under a root-like HOME the playbook fails with "couldn't resolve
-    module/action 'ansible.posix.acl'" because Ansible's default collection path
-    is `{{ ANSIBLE_HOME }}/collections` and root's ANSIBLE_HOME is not the
-    developer's.
+  - Ansible and its collections are resolved by `resolve_ansible()` from
+    `sys.prefix`, in the ROOT half, not by the caller. Measured twice: passing them
+    as arguments let a caller-supplied collection directory reach root, and asking
+    `ansible-playbook --version` reported the path under the CALLER's HOME, which is
+    why the elevated half could not resolve `ansible.posix` at all.
+    `install.sh` puts both in the installation.
 
   - pydantic validates what comes from outside: the command line (`Config`) and
     the state file (`State`). It cannot carry a lone surrogate, so a path that is

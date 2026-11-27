@@ -48,9 +48,16 @@ class AssertTrustedTest(unittest.TestCase):
         (shim / 'stat').write_text(
             textwrap.dedent(f'''\
                 #!/bin/sh
-                case "$2" in
-                    %u) echo {uid}; exit 0 ;;
-                    %a) echo {mode}; exit 0 ;;
+                # The guard walks every ancestor, so only the TARGET answers with the
+                # test's values; real stat answers for "/" and the directories above.
+                last=""
+                for a in "$@"; do last="$a"; done
+                case "$last" in
+                    "{target}")
+                        case "$*" in
+                            *%u*) echo {uid}; exit 0 ;;
+                            *%a*) echo {mode}; exit 0 ;;
+                        esac ;;
                 esac
                 exec /usr/bin/stat "$@"
                 '''),
@@ -89,13 +96,20 @@ class AssertTrustedTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode, 'a world-writable directory was accepted')
         self.assertIn('group- or world-writable', result.stderr)
 
-    def test_a_root_owned_read_only_directory_is_accepted(self):
-        """The known-good case, so the guard is not simply always failing."""
+    def test_a_path_under_a_world_writable_ancestor_is_refused(self):
+        """The walk covers EVERY component, so `/tmp/...` never passes.
+
+        This is the point of the fix rather than a limitation: a root-owned file in
+        a directory any user can write is a file any user can replace.
+        """
         target = self.work / 'fine'
         target.mkdir()
         result = self._run(uid=0, mode='755', target=target)
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual('', result.stderr)
+        self.assertNotEqual(0, result.returncode, 'an unusable ancestor must refuse')
+        # Ownership is checked before mode, so a directory owned by this user is
+        # named by uid. Either message is a refusal for the right reason.
+        self.assertTrue('not root' in result.stderr or 'world-writable' in result.stderr,
+                        result.stderr)
 
     def test_a_missing_directory_is_not_a_refusal(self):
         """A fresh host has no $LIB yet; creating it is the installer's job."""
@@ -179,12 +193,15 @@ class SymlinkGuardTest(unittest.TestCase):
                          f'a root-owned target must be accepted, got: {result.stderr}')
         self.assertEqual('', result.stderr)
 
-    def test_the_guard_consults_the_target_not_the_link(self):
-        """Pinned by shape as well: the link branch must ask for the followed stat."""
+    def test_the_guard_walks_the_given_path_and_its_canonical_target(self):
+        """Pinned by shape. `readlink -f` ALONE is the bug: it answers the target
+        (/usr/bin/uv, all root-owned) and forgets that the directory holding the
+        link is world-writable and can re-point it before the exec."""
         text = INSTALL_SH.read_text(encoding='utf-8')
-        self.assertIn('if [ -L "$path" ]', text)
-        self.assertIn('stat -L -c %u "$path"', text)
-        self.assertIn('stat -L -c "%a" "$path"', text)
+        self.assertIn('_walk "$(case $path in', text, 'the path as given is walked')
+        self.assertIn('_walk "$canonical"', text, 'and its canonical target')
+        # `-L` on directories too: /usr/sbin -> bin reports 0777 otherwise.
+        self.assertIn('stat -L -c %u "$check"', text)
 
     def test_a_dangling_symlink_does_not_abort_the_guard(self):
         link = self.tmp / 'dangling'
@@ -259,6 +276,46 @@ class ToolTrustTest(unittest.TestCase):
         self.assertIn(probe, self.text)
         older = "bin/python\" -E -c 'import agent_isolation"
         self.assertNotIn(older, self.text)
+
+
+class DependencyLockTest(unittest.TestCase):
+    """The committed lock must be what gets installed, not a date cutoff.
+
+    A wheel carries RANGES (`click<9,>=8.1`), so installing it alone re-resolves
+    and can produce a different runtime from the same commit. Measured: the
+    installed `click` was 8.5.1 while nothing forced it.
+    """
+
+    def setUp(self):
+        self.text = INSTALL_SH.read_text(encoding='utf-8')
+        self.lock = REPO_ROOT / 'uv.lock'
+
+    def test_the_lock_file_is_committed(self):
+        self.assertTrue(self.lock.is_file(), 'uv.lock is the authoritative pin')
+
+    def test_the_lock_is_exported_and_passed_as_constraints(self):
+        self.assertIn('"$UV" export', self.text)
+        self.assertIn('--format requirements-txt', self.text)
+        install = self.text.index('"$UV" tool install')
+        segment = self.text[install:install + 400]
+        self.assertIn('--constraints "$CONSTRAINTS"', segment)
+
+    def test_a_missing_lock_refuses_instead_of_resolving_freely(self):
+        self.assertIn('cannot export the dependency lock', self.text)
+        self.assertIn('is uv.lock committed?', self.text)
+
+    def test_the_date_cutoff_is_not_the_pin(self):
+        """`--exclude-newer` limits the index window; it does NOT reproduce a lock."""
+        self.assertNotIn('--exclude-newer', self.text,
+                         'a date cutoff is not the locked resolution')
+
+    def test_every_runtime_dependency_is_pinned_in_the_lock(self):
+        import re
+
+        text = self.lock.read_text(encoding='utf-8')
+        for name in ('click', 'pydantic', 'ansible-core'):
+            entry = re.search(rf'name = "{re.escape(name)}"\nversion = "([^"]+)"', text)
+            self.assertIsNotNone(entry, f'{name} is pinned in uv.lock')
 
 
 class UpgradeSafetyTest(unittest.TestCase):
