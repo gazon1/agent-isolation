@@ -1166,6 +1166,45 @@ class ElevateTest(Base):
         self.assertIn('agent_isolation', command, 'the package, not a path into a checkout')
         self.assertNotIn(str(aa.__file__), command, 'this file is not named by path')
 
+    def test_a_decoy_package_in_the_working_directory_cannot_be_imported(self):
+        """The real attack: run the privileged command from a hostile directory.
+
+        `-E` ignores PYTHON* variables but leaves the CURRENT DIRECTORY on
+        `sys.path`, so `-m agent_isolation` from a directory holding a decoy
+        `agent_isolation/` package imports the decoy — as root. Measured: under
+        `-E` the decoy printed its own output, under `-I` it was ignored.
+
+        This asserts the SHAPE (`-I` present, no `-E`) and, when the tool is
+        installed, runs the real command from such a directory to prove the decoy
+        was not executed.
+        """
+        import subprocess as sp
+        import tempfile
+
+        ctx = self.context()
+        command = aa.reexec_command(ctx.cfg, 'apply')
+        self.assertIn('-I', command, 'isolated mode keeps the cwd off sys.path')
+        self.assertNotIn('-E', command, '-E alone is the hole this test is about')
+
+        interpreter = command[command.index('--') + 1]
+        probe = sp.run([interpreter, '-I', '-c', 'import agent_isolation'], capture_output=True, text=True, check=False)
+        if probe.returncode != 0:
+            self.skipTest('the tool is not installed under this interpreter; install it to run this check')
+
+        decoy = pathlib.Path(tempfile.mkdtemp(prefix='aa-decoy-'))
+        self.addCleanup(__import__('shutil').rmtree, decoy, True)
+        (decoy / 'agent_isolation').mkdir()
+        marker = 'DECOY-WAS-IMPORTED'
+        (decoy / 'agent_isolation' / '__init__.py').write_text(
+            f'raise SystemExit({marker!r})\n', encoding='utf-8'
+        )
+        (decoy / 'agent_isolation' / '__main__.py').write_text(
+            f'raise SystemExit({marker!r})\n', encoding='utf-8'
+        )
+        out = sp.run([interpreter, '-I', '-m', 'agent_isolation'],
+                     capture_output=True, text=True, cwd=str(decoy), check=False)
+        self.assertNotIn(marker, out.stdout + out.stderr, 'the decoy package was executed')
+
     def test_the_elevated_interpreter_can_import_the_tool_when_installed(self):
         """The real thing: the interpreter the command names can import the tool.
 
@@ -1179,13 +1218,13 @@ class ElevateTest(Base):
         ctx = self.context()
         command = aa.reexec_command(ctx.cfg, 'apply')
         interpreter = command[command.index('--') + 1]
-        probe = sp.run([interpreter, '-E', '-c', 'import agent_isolation'], capture_output=True, text=True, check=False)
+        probe = sp.run([interpreter, '-I', '-c', 'import agent_isolation'], capture_output=True, text=True, check=False)
         if probe.returncode != 0:
             self.skipTest('the tool is not installed under this interpreter; install it to run this check')
-        out = sp.run([interpreter, '-E', '-m', 'agent_isolation', '--help'],
+        out = sp.run([interpreter, '-I', '-m', 'agent_isolation', '--help'],
                      capture_output=True, text=True, check=False)
         self.assertEqual(0, out.returncode, out.stderr)
-        self.assertIn('Usage:', out.stdout, 'the installed module imported under -E')
+        self.assertIn('Usage:', out.stdout, 'the installed module imported under -I')
 
     def test_the_elevated_command_carries_what_root_cannot_find(self):
         """Measured: neither Ansible nor its collection path is on root's
@@ -1194,12 +1233,12 @@ class ElevateTest(Base):
         command = aa.reexec_command(ctx.cfg, 'apply')
         self.assertIn(str(ctx.cfg.ansible_playbook), command)
         self.assertIn(str(ctx.cfg.ansible_collections_path), command)
-        # `-E` and not `-I`: both ignore PYTHON* variables, but `-I` also implies
-        # `-s`, which drops the user site where a `pip install --user` pydantic
-        # lives. Measured on this host: the root half died with
-        # "No module named 'pydantic'" under `-I` and imports fine under `-E`.
-        self.assertIn('-E', command, 'root must not inherit PYTHON* variables')
-        self.assertNotIn('-I', command, '-I drops the user site those deps may live in')
+        # `-I`, which IMPLIES `-E`: PYTHON* variables are ignored either way, but
+        # `-E` alone leaves the working directory on sys.path. `-I` additionally
+        # drops the USER site — not the interpreter's own venv, which is where
+        # `uv tool install` puts the dependencies, so they still import.
+        self.assertIn('-I', command, 'isolated mode: no PYTHON* vars, no caller cwd')
+        self.assertNotIn('-E', command, '-I already implies -E; a bare -E is the bug')
 
 
 # ---------------------------------------------------------------------------
@@ -2065,6 +2104,7 @@ class AnsibleResolutionTest(unittest.TestCase):
         """`-m agent_isolation` and not a filesystem path: pip/uv model of trust."""
         source = pathlib.Path(aa.__file__).read_text(encoding='utf-8')
         self.assertIn('"-m", "agent_isolation"', source)
+        self.assertIn('"-I", "-m", "agent_isolation"', source)
         self.assertNotIn('str(SELF_PATH)', source, 'the checkout path is no longer an argument')
 
     def test_an_explicit_playbook_still_has_its_mise_shim_resolved(self):

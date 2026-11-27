@@ -75,8 +75,12 @@ command -v uv >/dev/null 2>&1 || {
 }
 
 # Refuse BEFORE creating anything: a world-writable parent is not a trusted root.
-assert_trusted "$PREFIX/lib" "$PREFIX/bin"
-mkdir -p "$LIB"
+# $LIB itself is checked too — an existing directory owned by somebody else, or
+# writable by them, is a place `uv` would run as root inside.
+assert_trusted "$PREFIX/lib" "$PREFIX/bin" "$LIB"
+# Created 0755 and root-owned by this root-owned call: the mode is set explicitly
+# because the caller's umask must not be able to loosen it.
+install -d -m 0755 -o root -g root "$LIB"
 
 # `uv tool install` builds a wheel and unpacks it into a venv under this directory,
 # so the installed tree is a COPY: the checkout is not linked into it, and

@@ -2629,13 +2629,18 @@ def reexec_command(cfg: Config, verb: str) -> list[str]:
     found: sudo's secure_path has no developer-installed interpreters. Every setting
     is passed explicitly, because sudo drops the environment.
 
-    `-E`, not `-I`: neither inherits a `PYTHONPATH`, which is the point, but `-I`
-    would also drop the installer's own site-packages — and with `uv tool install`
-    that IS where `click`/`pydantic`/`ansible-core` live. Both the interpreter and
-    the module are the installed ones, so the root half runs root-owned code and the
-    caller's checkout is never re-executed (issue #5)."""
+    `-I` (isolated), not `-E`. `-E` only ignores PYTHON* variables: it leaves the
+    CURRENT DIRECTORY in `sys.path`, so `python -E -m agent_isolation` run from a
+    directory containing an `agent_isolation/` package imports THAT one. Measured
+    from a scratch directory holding a decoy package: `-E` printed the decoy's
+    output, `-I` ignored it. `-I` also implies `-E`, and it drops the user site
+    while keeping the interpreter's own venv — which is where `uv tool install`
+    puts `click`/`pydantic`/`ansible-core`, so the installed dependencies still
+    import. Both the interpreter and the module are the installed ones, so the
+    root half runs root-owned code and the caller's tree is never executed
+    (issue #5)."""
     argv = [
-        "sudo", "--", sys.executable, "-E", "-m", "agent_isolation", verb,
+        "sudo", "--", sys.executable, "-I", "-m", "agent_isolation", verb,
         "--dev", cfg.dev_name,
         "--agent-user", cfg.agent_user,
         "--agent-group", cfg.agent_group,
