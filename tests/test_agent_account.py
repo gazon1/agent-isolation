@@ -1507,6 +1507,18 @@ class SharedGitStoreTest(Base):
             self.assertEqual('r-x', grant['permissions'], 'write on .git/ means rename-over-config')
             self.assertFalse(grant['recursive'], 'a recursive grant would cover config again')
 
+    def test_check_asks_for_what_apply_writes_on_the_common_dir(self):
+        """`apply` writes `.git` as `r-x`; `check` asked for `rwx` and failed every
+        correctly provisioned host — measured on the first live apply."""
+        source = pathlib.Path(aa.__file__).read_text(encoding='utf-8')
+        # The check asks for read-only on the common dir...
+        self.assertIn('read = AclSpec("group", group, "r-x")', source)
+        self.assertIn('self.check_grant(common, read, read.as_default(), "git")', source)
+        # ...and no longer asks for write there.
+        self.assertNotIn('self.check_grant(common, write, write.as_default(), "git")', source)
+        # The writable subdirectories are still checked as writable.
+        self.assertIn('for writable in ("objects", "refs", "logs", "worktrees")', source)
+
     def test_only_the_directories_git_writes_are_granted_recursively(self):
         """objects, refs, logs, worktrees — and nothing else. Measured: with exactly
         these writable, status/diff/add/commit/branch/checkout all still work."""
@@ -2099,6 +2111,35 @@ class AnsibleResolutionTest(unittest.TestCase):
         finally:
             sh.which = saved
         self.assertTrue(str(found).startswith(str(aa.sys.prefix)), found)
+
+    def test_the_collections_come_from_the_installation_not_somebody_s_HOME(self):
+        """Measured on the live install: `ansible-playbook --version` reports the
+        collections path under the CALLER's HOME, so `apply` (root, HOME=/root)
+        failed to resolve ansible.posix.acl while `--dry-run` passed.
+
+        A path that changes with whose HOME asked is not an installed path.
+        """
+        import tempfile
+
+        root = pathlib.Path(tempfile.mkdtemp(prefix='aa-colls-'))
+        self.addCleanup(__import__('shutil').rmtree, root, True)
+        # Shape of the real install: <prefix>/agent-isolation (venv) + <prefix>/collections
+        venv = root / 'agent-isolation'
+        (venv / 'bin').mkdir(parents=True)
+        fake = venv / 'bin' / 'ansible-playbook'
+        fake.write_text('#!/bin/sh\necho "  collections path = /home/somebody/.ansible/collections"\n',
+                        encoding='utf-8')
+        fake.chmod(0o755)
+        (root / 'collections' / 'ansible_collections').mkdir(parents=True)
+
+        saved_prefix = aa.sys.prefix
+        try:
+            aa.sys.prefix = str(venv)
+            _, collections = aa.resolve_ansible(fake)
+        finally:
+            aa.sys.prefix = saved_prefix
+        self.assertEqual(str(root / 'collections'), collections,
+                         'the installed collections win over HOME-derived output')
 
     def test_the_privileged_module_path_is_the_package(self):
         """`-m agent_isolation` and not a filesystem path: pip/uv model of trust."""

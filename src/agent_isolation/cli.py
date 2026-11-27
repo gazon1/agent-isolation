@@ -2046,7 +2046,17 @@ class Checker:
                 continue
             self.check_grant(root, write, write.as_default(), "git")
             common = self.ctx.git.common_dir(root)
-            self.check_grant(common, write, write.as_default(), "git")
+            # `.git` itself is `r-x`, NOT `rwx`: write on the directory is what lets
+            # a fresh `config.lock` be renamed over `config`. `apply` has always
+            # written it that way; `check` asking for `rwx` failed every correctly
+            # provisioned host — measured on the first live apply.
+            read = AclSpec("group", group, "r-x")
+            self.check_grant(common, read, read.as_default(), "git")
+            # ...while the directories git actually writes must be writable.
+            for writable in ("objects", "refs", "logs", "worktrees"):
+                directory = common / writable
+                if directory.is_dir():
+                    self.check_grant(directory, write, write.as_default(), "git")
             # And the two paths that must NOT be writable there. A plan that denies
             # them and a check that never looks would certify the escalation.
             self.check_denied(common / "config", AclSpec("group", group, "rwX"))
@@ -2527,8 +2537,17 @@ def resolve_ansible(playbook: Path | None, explicit: str = "") -> tuple[Path, st
     found = Path(playbook) if playbook else trusted_bin("ansible-playbook")
     collections = explicit or os.environ.get("ANSIBLE_COLLECTIONS_PATH", "")
     if not collections:
-        # Ask the INSTALLED binary: it reports the collection path of the venv it
-        # lives in, which is where `install.sh` put `ansible.posix`.
+        # The installation's own collections first, and it is checked by shape
+        # rather than by asking Ansible. Measured: `ansible-playbook --version`
+        # reports the collections path under the CALLER's HOME
+        # (/home/max/.ansible/...), and the root half runs with HOME=/root — so
+        # `apply` as root died with "couldn't resolve module/action
+        # 'ansible.posix.acl'" while `--dry-run` (same HOME) passed. A path that
+        # depends on whose HOME asked is not an installed path.
+        installed = Path(sys.prefix).parent / "collections"
+        if (installed / "ansible_collections").is_dir():
+            collections = str(installed)
+    if not collections:
         dumped = subprocess.run(
             [str(found), "--version"], capture_output=True, text=True, check=False
         ).stdout

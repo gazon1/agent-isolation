@@ -129,5 +129,97 @@ class GuardOrderTest(unittest.TestCase):
         self.assertNotIn('mkdir -p "$LIB"', self.text)
 
 
+class SymlinkGuardTest(unittest.TestCase):
+    """A symlink must be judged by its TARGET, and the uninstall must work.
+
+    Measured on the first live install: `--uninstall` refused to remove its own
+    `/usr/local/bin/agent-account`, because `stat` on a link reports 0777 whatever
+    it points at. The installer could not undo itself.
+
+    `stat` is shimmed to reproduce that exactly: 0777 without `-L`, 0755 with it.
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix='aa-link-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.fn = _extract_assert_trusted()
+        self.shim = self.tmp / 'shim'
+        self.shim.mkdir()
+        (self.shim / 'stat').write_text(
+            textwrap.dedent('''\
+                #!/bin/sh
+                # Follow-link (stat -L) answers like the real target; a bare stat on a
+                # link answers 0777, which is what Linux actually does.
+                follow=no
+                for a in "$@"; do [ "$a" = "-L" ] && follow=yes; done
+                case "$*" in
+                    *%u*) if [ "$follow" = yes ]; then echo 0; else echo 0; fi; exit 0 ;;
+                    *%a*) if [ "$follow" = yes ]; then echo 755; else echo 777; fi; exit 0 ;;
+                esac
+                exec /usr/bin/stat "$@"
+                '''),
+            encoding='utf-8',
+        )
+        (self.shim / 'stat').chmod(0o755)
+
+    def _run(self, target: pathlib.Path) -> subprocess.CompletedProcess:
+        env = dict(os.environ, PATH=f'{self.shim}:{os.environ["PATH"]}')
+        script = self.fn + f'\nassert_trusted "{target}"\n'
+        return subprocess.run(['sh', '-c', script], capture_output=True, text=True,
+                              check=False, env=env)
+
+    def test_a_symlink_to_a_root_owned_read_only_target_is_accepted(self):
+        """The install's own layout: /usr/local/bin/agent-account -> root-owned venv."""
+        real = self.tmp / 'real-command'
+        real.write_text('#!/bin/sh\n', encoding='utf-8')
+        link = self.tmp / 'link'
+        link.symlink_to(real)
+        result = self._run(link)
+        self.assertEqual(0, result.returncode,
+                         f'a root-owned target must be accepted, got: {result.stderr}')
+        self.assertEqual('', result.stderr)
+
+    def test_the_guard_consults_the_target_not_the_link(self):
+        """Pinned by shape as well: the link branch must ask for the followed stat."""
+        text = INSTALL_SH.read_text(encoding='utf-8')
+        self.assertIn('if [ -L "$path" ]', text)
+        self.assertIn('stat -L -c %u "$path"', text)
+        self.assertIn('stat -L -c "%a" "$path"', text)
+
+    def test_a_dangling_symlink_does_not_abort_the_guard(self):
+        link = self.tmp / 'dangling'
+        link.symlink_to(self.tmp / 'nowhere')
+        result = self._run(link)
+        self.assertNotIn('Not a directory', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+
+
+class ToolTrustTest(unittest.TestCase):
+    """Every binary the installer runs AS ROOT is checked, not just the code."""
+
+    def setUp(self):
+        self.text = INSTALL_SH.read_text(encoding='utf-8')
+
+    def test_uv_itself_is_checked_before_it_runs(self):
+        """Measured on Fedora: `command -v uv` answered a mode-0777 mise shim owned
+        by uid 1000. Running THAT as root is the hole the install exists to close."""
+        guard = self.text.index('assert_trusted "$UV"')
+        first_uv = self.text.index('tool install')
+        self.assertLess(guard, first_uv, 'uv is trusted-checked before it runs')
+        self.assertIn('UV=$(command -v uv', self.text, 'the path is resolved once, then checked')
+
+    def test_the_interpreter_is_pinned_to_root_s_own_python(self):
+        """A bare `--python 3.12` lets uv resolve into a user-owned download."""
+        self.assertIn('--python /usr/bin/python3', self.text)
+        self.assertNotIn('--python 3.12', self.text)
+
+    def test_the_post_install_probe_uses_the_same_isolation_as_the_tool(self):
+        """The check must exercise what `apply` will actually execute."""
+        probe = "bin/python\" -I -c 'import agent_isolation"
+        self.assertIn(probe, self.text)
+        older = "bin/python\" -E -c 'import agent_isolation"
+        self.assertNotIn(older, self.text)
+
+
 if __name__ == '__main__':
     unittest.main()
