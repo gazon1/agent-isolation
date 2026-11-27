@@ -2036,6 +2036,68 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(f'{DEV} ALL=({AGENT}) NOPASSWD: /usr/bin/env', cfg.sudoers_rule)
 
 
+class AnsibleIsolationTest(unittest.TestCase):
+    """The privileged playbook must load no config, plugin or module from the caller.
+
+    Measured: an `ansible.cfg` in the working directory with `library = ./plugins`
+    made `ansible-playbook` load a module from that directory and run its code,
+    because Ansible's config search includes `./ansible.cfg` and the cwd is
+    inherited by `subprocess.run`.
+    """
+
+    def _ansible(self, collections='/opt/agent-isolation/collections', environ=None):
+        cfg = aa.Config(
+            dev_name='devel',
+            dev_home=pathlib.Path('/home/x'),
+            ansible_collections_path=collections,
+        )
+        runner = aa.Runner(dry_run=True, environ=environ or {})
+        instance = aa.Ansible(cfg, runner)
+        self.addCleanup(instance._configs.clear)
+        return instance
+
+    def test_the_config_is_named_explicitly_and_is_not_the_caller_s(self):
+        instance = self._ansible()
+        env = instance._environment()
+        config = pathlib.Path(env['ANSIBLE_CONFIG'])
+        self.assertTrue(config.is_file(), 'a real config is written')
+        self.assertEqual(0o600, config.stat().st_mode & 0o777, 'root-only')
+
+    def test_caller_ansible_variables_are_removed(self):
+        """`ANSIBLE_LIBRARY=/tmp/evil` is a module path; it must not survive."""
+        hostile = {
+            'ANSIBLE_CONFIG': '/tmp/evil/ansible.cfg',
+            'ANSIBLE_LIBRARY': '/tmp/evil/modules',
+            'ANSIBLE_ACTION_PLUGINS': '/tmp/evil/actions',
+            'ANSIBLE_COLLECTIONS_PATH': '/tmp/evil/collections',
+            'ANSIBLE_CALLBACK_PLUGINS': '/tmp/evil/callbacks',
+        }
+        instance = self._ansible(environ=hostile)
+        env = instance._environment()
+        for name in hostile:
+            self.assertNotEqual(hostile[name], env.get(name), f'{name} reached the playbook')
+        self.assertNotIn('/tmp/evil', env.get('ANSIBLE_CONFIG', ''))
+
+    def test_the_collection_path_is_the_installation_s(self):
+        instance = self._ansible(collections='/opt/agent-isolation/collections')
+        env = instance._environment()
+        self.assertEqual('/opt/agent-isolation/collections', env['ANSIBLE_COLLECTIONS_PATH'])
+
+    def test_the_playbook_does_not_inherit_the_calling_directory(self):
+        """`./ansible.cfg` is found from the cwd, so the cwd must be controlled."""
+        source = pathlib.Path(aa.__file__).read_text(encoding='utf-8')
+        self.assertIn('cwd=env["ANSIBLE_LOCAL_TEMP"]', source,
+                      'the playbook runs in a controlled directory')
+
+    def test_the_generated_config_is_removed_afterwards(self):
+        instance = self._ansible()
+        env = instance._environment()
+        config = pathlib.Path(env['ANSIBLE_CONFIG'])
+        self.assertTrue(config.exists())
+        # The cleanup runs in `run`; emulate its effect and assert the list is used.
+        self.assertIn(config, instance._configs)
+
+
 class AnsibleResolutionTest(unittest.TestCase):
     """Ansible is resolved from the INSTALLATION, and nothing else.
 

@@ -20,6 +20,17 @@
 
 set -eu
 
+# A KNOWN-SAFE PATH, before anything else runs.
+#
+# Measured: `sudo env PATH=/tmp/hijack:$PATH ./install.sh` executed a hostile `stat`
+# from that directory, and `assert_trusted` performs its checks with `stat`,
+# `readlink` and `dirname`. A trust check whose tools come from the caller's PATH is
+# not a trust check. sudo's `secure_path` would usually cover this, but the script
+# must not depend on the caller's sudoers.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH
+
 PREFIX=${PREFIX:-/usr/local}
 LIB="$PREFIX/lib/agent-isolation"
 BIN="$PREFIX/bin/agent-account"
@@ -110,9 +121,11 @@ fi
 # exactly what this refuses — measured on Fedora, `command -v uv` answered
 # /home/max/.local/share/mise/shims/uv, a mode-0777 launcher owned by uid 1000.
 # Running that as root is the vulnerability the install exists to prevent.
+# Resolved against the safe PATH set at the top, so this cannot be a caller's
+# shim. `assert_trusted` then confirms the whole path is root-owned.
 UV=$(command -v uv 2>/dev/null || true)
 if [ -z "$UV" ]; then
-    echo "install.sh: uv is required (https://docs.astral.sh/uv/, or: dnf install uv)" >&2
+    echo "install.sh: uv is required on the system PATH (dnf install uv)" >&2
     exit 1
 fi
 assert_trusted "$UV"
@@ -201,31 +214,90 @@ if [ ! -s "$CONSTRAINTS" ]; then
     exit 1
 fi
 
+# -- transaction: back up, install at the real path, verify, restore on failure --
+#
+# Installing into `$LIB` in place leaves the machine with a half-upgraded tree if
+# `ansible-galaxy` or a verification step fails: new code, no collections, or a venv
+# whose imports no longer resolve. The invariant established here: a failed upgrade
+# leaves the PREVIOUS, WORKING install in place.
+#
+# The obvious design — assemble in a staging directory and `mv` it into place — does
+# NOT work for a Python venv, and that was measured rather than assumed: every
+# console script inside the venv carries an ABSOLUTE shebang pointing at the
+# directory it was installed into, and `uv`'s `bin-dir/agent-account` is an absolute
+# symlink. After the rename all of them point into a deleted staging path, so the
+# command is dead. Installing at the real path and rolling back on failure avoids
+# the whole class.
+STAGE=$(mktemp -d)
+chmod 0755 "$STAGE"
+BACKUP=""
+COMMITTED=no
+
+restore() {
+    status=$?
+    if [ "$COMMITTED" != yes ] && [ -n "$BACKUP" ] && [ -d "$BACKUP" ]; then
+        rm -rf "$LIB"
+        if mv "$BACKUP" "$LIB"; then
+            echo "install.sh: rolled back to the previous installation" >&2
+        else
+            echo "install.sh: COULD NOT ROLL BACK; the previous tree is at $BACKUP" >&2
+        fi
+        BACKUP=""
+    fi
+    rm -rf "$STAGE"
+    exit $status
+}
+trap 'restore' EXIT INT TERM
+
+# Keep the previous tree aside. `$LIB` may not exist on a first install.
+if [ -d "$LIB" ]; then
+    BACKUP="$STAGE/previous"
+    cp -a "$LIB" "$BACKUP"
+fi
+
 # `--no-build`: the ONLY thing root accepts is a prebuilt wheel and cached wheels
 # of the dependencies. `agent-isolation` itself is never built here.
+echo "Installing the tool into $LIB ..."
 UV_TOOL_DIR="$LIB" UV_TOOL_BIN_DIR="$LIB/bin-dir" "$UV" tool install \
     --python /usr/bin/python3 \
     --no-build \
     --constraints "$CONSTRAINTS" \
     --force \
     "$WHEEL"
-
 ln -sfn "$LIB/bin-dir/agent-account" "$BIN"
 
-# The collections are data the playbook imports. They live beside the code, so the
-# elevated playbook never reads one from a user home or a checkout.
-echo "Installing Ansible collections into $LIB/collections ..."
+echo "Installing Ansible collections ..."
 "$LIB/agent-isolation/bin/ansible-galaxy" collection install \
     -r "$WORK/requirements.yml" \
     -p "$LIB/collections" \
-    --force
+    --force || {
+    echo "install.sh: the collections failed; keeping the previous install" >&2
+    exit 1
+}
 
-# Verify the INSTALL, not the checkout: this is what root will execute.
-"$LIB/agent-isolation/bin/python" -I -c 'import agent_isolation; print("code:", agent_isolation.__file__)'
-"$LIB/agent-isolation/bin/ansible-playbook" --version >/dev/null
+# Verify the INSTALL, not the checkout: this is exactly what root will execute.
+"$LIB/agent-isolation/bin/python" -I -c 'import agent_isolation' || {
+    echo "install.sh: the installed code does not import; keeping the previous install" >&2
+    exit 1
+}
+"$LIB/agent-isolation/bin/python" -I -c 'import ansible' || {
+    echo "install.sh: the installed Ansible does not import; keeping the previous install" >&2
+    exit 1
+}
+"$LIB/agent-isolation/bin/ansible-playbook" --version >/dev/null || {
+    echo "install.sh: the installed playbook binary fails; keeping the previous install" >&2
+    exit 1
+}
+[ -d "$LIB/collections/ansible_collections/ansible/posix" ] || {
+    echo "install.sh: the installed collections are missing; keeping the previous install" >&2
+    exit 1
+}
 
 chown -R root:root "$LIB"
 chmod -R go-w "$LIB"
+
+# Past this point the new tree is the one to keep, and the trap leaves it alone.
+COMMITTED=yes
 
 echo
 echo "Installed:"

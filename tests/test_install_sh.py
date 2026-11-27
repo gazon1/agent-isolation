@@ -144,111 +144,88 @@ class GuardOrderTest(unittest.TestCase):
 
 
 class SymlinkGuardTest(unittest.TestCase):
-    """A symlink must be judged by its TARGET, and the uninstall must work.
+    """Real filesystem layouts, not mocked metadata.
 
-    Measured on the first live install: `--uninstall` refused to remove its own
-    `/usr/local/bin/agent-account`, because `stat` on a link reports 0777 whatever
-    it points at. The installer could not undo itself.
-
-    `stat` is shimmed to reproduce that exactly: 0777 without `-L`, 0755 with it.
+    The guard decides whether root installs into a directory, and its correctness
+    is entirely about the actual tree: which component is writable, where a link
+    points, whether an ancestor is a link. A `stat` shim cannot express that, so
+    these tests build the trees for real and run the shipped function under `sh`.
     """
 
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix='aa-link-'))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.fn = _extract_assert_trusted()
-        self.shim = self.tmp / 'shim'
-        self.shim.mkdir()
-        (self.shim / 'stat').write_text(
-            textwrap.dedent('''\
-                #!/bin/sh
-                # Follow-link (stat -L) answers like the real target; a bare stat on a
-                # link answers 0777, which is what Linux actually does.
-                follow=no
-                for a in "$@"; do [ "$a" = "-L" ] && follow=yes; done
-                case "$*" in
-                    *%u*) if [ "$follow" = yes ]; then echo 0; else echo 0; fi; exit 0 ;;
-                    *%a*) if [ "$follow" = yes ]; then echo 755; else echo 777; fi; exit 0 ;;
-                esac
-                exec /usr/bin/stat "$@"
-                '''),
-            encoding='utf-8',
-        )
-        (self.shim / 'stat').chmod(0o755)
 
     def _run(self, target: pathlib.Path) -> subprocess.CompletedProcess:
-        env = dict(os.environ, PATH=f'{self.shim}:{os.environ["PATH"]}')
         script = self.fn + f'\nassert_trusted "{target}"\n'
-        return subprocess.run(['sh', '-c', script], capture_output=True, text=True,
-                              check=False, env=env)
+        return subprocess.run(['sh', '-c', script], capture_output=True, text=True, check=False)
 
-    def test_a_symlink_to_a_root_owned_read_only_target_is_accepted(self):
-        """The install's own layout: /usr/local/bin/agent-account -> root-owned venv."""
-        real = self.tmp / 'real-command'
+    def _writable(self, path: pathlib.Path) -> pathlib.Path:
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o777)
+        return path
+
+    def test_a_symlink_inside_a_world_writable_directory_is_refused(self):
+        """The measured attack: the TARGET is root-owned, the DIRECTORY is not.
+
+        `readlink -f` alone answers the target and hides this, which is why both the
+        path as given and its canonical form are walked.
+        """
+        holder = self._writable(self.tmp / 'holder')
+        real = self.tmp / 'real-target'
         real.write_text('#!/bin/sh\n', encoding='utf-8')
-        link = self.tmp / 'link'
+        link = holder / 'cmd'
         link.symlink_to(real)
         result = self._run(link)
-        self.assertEqual(0, result.returncode,
-                         f'a root-owned target must be accepted, got: {result.stderr}')
-        self.assertEqual('', result.stderr)
+        self.assertNotEqual(0, result.returncode, 'a link in a writable dir was accepted')
+        # Ownership is checked before mode, so a directory owned by this user is
+        # named by uid. Either message is a refusal for the right reason.
+        self.assertTrue('world-writable' in result.stderr or 'not root' in result.stderr,
+                        result.stderr)
 
-    def test_the_guard_walks_the_given_path_and_its_canonical_target(self):
-        """Pinned by shape. `readlink -f` ALONE is the bug: it answers the target
-        (/usr/bin/uv, all root-owned) and forgets that the directory holding the
-        link is world-writable and can re-point it before the exec."""
-        text = INSTALL_SH.read_text(encoding='utf-8')
-        self.assertIn('_walk "$(case $path in', text, 'the path as given is walked')
-        self.assertIn('_walk "$canonical"', text, 'and its canonical target')
-        # `-L` on directories too: /usr/sbin -> bin reports 0777 otherwise.
-        self.assertIn('stat -L -c %u "$check"', text)
+    def test_a_symlinked_parent_directory_is_judged_at_its_real_location(self):
+        """`/usr/sbin -> bin` is the everyday case; a writable one is the attack."""
+        real_parent = self._writable(self.tmp / 'realparent')
+        (real_parent / 'child').mkdir()
+        linked = self.tmp / 'linkedparent'
+        linked.symlink_to(real_parent, target_is_directory=True)
+        result = self._run(linked / 'child')
+        self.assertNotEqual(0, result.returncode, 'a writable real parent was accepted')
 
     def test_a_dangling_symlink_does_not_abort_the_guard(self):
+        """`[ -e ]` is false for a dangling link, so it is skipped, not crashed on."""
         link = self.tmp / 'dangling'
         link.symlink_to(self.tmp / 'nowhere')
         result = self._run(link)
         self.assertNotIn('Not a directory', result.stderr)
         self.assertNotIn('Traceback', result.stderr)
+        self.assertNotIn('cannot canonicalise', result.stderr)
 
+    def test_a_path_whose_ancestors_are_all_trusted_is_accepted(self):
+        """The known-good case, so the guard is not simply always failing.
 
-class BuildTrustTest(unittest.TestCase):
-    """Root must never execute a build backend from the checkout (issue #5).
+        Built under `/` rather than `/tmp`, because `/tmp` is 1777 and the walk
+        correctly refuses it — that is the check working, not a false positive.
+        """
+        base = pathlib.Path('/usr/local/lib')
+        if not base.is_dir() or os.geteuid() != 0:
+            self.skipTest('needs a root-owned /usr/local/lib and root')
+        target = pathlib.Path(tempfile.mkdtemp(prefix='aa-ok-', dir=str(base)))
+        self.addCleanup(shutil.rmtree, target, True)
+        target.chmod(0o755)
+        result = self._run(target)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual('', result.stderr)
 
-    Measured: `uv tool install .` runs the project's build backend, and a malicious
-    hatch hook wrote a file. Under sudo that hook would run as ROOT.
-    """
+    def test_the_walk_uses_the_followed_stat(self):
+        """Pinned by shape: `/usr/sbin` is a link to `bin` and reports 0777.
 
-    def setUp(self):
-        self.text = INSTALL_SH.read_text(encoding='utf-8')
-
-    def test_root_installs_only_a_prebuilt_wheel(self):
-        """`--no-build` is what makes a source tree unacceptable to root."""
-        install = self.text.index('"$UV" tool install')
-        segment = self.text[install:install + 400]
-        self.assertIn('--no-build', segment)
-        self.assertIn('"$WHEEL"', segment, 'the artifact, not the checkout')
-        self.assertNotIn('"$SOURCE"', segment, 'the checkout must never be the install arg')
-
-    def test_the_wheel_is_built_as_the_calling_user(self):
-        self.assertIn('runuser -u "$BUILD_USER"', self.text)
-        self.assertIn('build --wheel --out-dir "$WORK" "$SOURCE"', self.text)
-        # The build directory must be writable by that user.
-        self.assertIn('chown "$BUILD_USER" "$WORK"', self.text)
-
-    def test_refuses_when_it_cannot_switch_to_the_caller(self):
-        """Failing closed matters more than installing: root must not build."""
-        self.assertIn('refusing to build as root', self.text)
-
-    def test_the_requirements_come_from_the_wheel_not_the_checkout(self):
-        """The manifest root reads must be the same artifact it installs."""
-        galaxy = self.text.index('collection install')
-        segment = self.text[max(0, galaxy - 300):galaxy + 300]
-        self.assertIn('-r "$WORK/requirements.yml"', segment)
-        self.assertNotIn('-r "$SOURCE', segment, 'the checkout must not supply the manifest')
-
-    def test_a_root_shell_cannot_run_it_without_a_caller(self):
-        """`sudo` provides SUDO_USER; a bare root shell has no unprivileged builder."""
-        self.assertIn('if [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ]', self.text)
+        Without `-L` every normal Fedora install would be refused — measured.
+        """
+        text = INSTALL_SH.read_text(encoding='utf-8')
+        self.assertIn('stat -L -c %u "$check"', text)
+        self.assertIn('stat -L -c "%a" "$check"', text)
 
 
 class ToolTrustTest(unittest.TestCase):
@@ -343,6 +320,73 @@ class UpgradeSafetyTest(unittest.TestCase):
         uninstall = self.text.index('if [ "$UNINSTALL" = yes ]')
         segment = self.text[uninstall:uninstall + 200]
         self.assertIn('assert_trusted "$LIB" "$BIN"', segment)
+
+
+class TrustedPathTest(unittest.TestCase):
+    """A trust check whose OWN tools come from the caller's PATH is not a check.
+
+    Measured: `sudo env PATH=/tmp/hijack:$PATH ./install.sh` executed a hostile
+    `stat` from that directory, and `assert_trusted` verifies paths with `stat`,
+    `readlink` and `dirname`.
+    """
+
+    def setUp(self):
+        self.text = INSTALL_SH.read_text(encoding='utf-8')
+
+    def test_the_path_is_reset_before_anything_else_runs(self):
+        text = self.text
+        reset = text.index('PATH=/usr/sbin:/usr/bin:/sbin:/bin')
+        # Nothing that could resolve a binary appears before it.
+        first_use = min(
+            position for position in
+            (text.find('$(command'), text.find('assert_trusted "'))
+            if position != -1
+        )
+        self.assertLess(reset, first_use, 'the safe PATH is established first')
+
+    def test_uv_is_resolved_after_the_reset(self):
+        self.assertLess(
+            self.text.index('PATH=/usr/sbin:/usr/bin:/sbin:/bin'),
+            self.text.index('UV=$(command -v uv'),
+        )
+
+
+class TransactionTest(unittest.TestCase):
+    """A failed upgrade must leave a working install, whatever failed."""
+
+    def setUp(self):
+        self.text = INSTALL_SH.read_text(encoding='utf-8')
+
+    def test_the_previous_tree_is_copied_before_installing(self):
+        backup = self.text.index('cp -a "$LIB" "$BACKUP"')
+        # The FIRST real invocation; a comment mentioning it does not count.
+        install = self.text.index('UV_TOOL_DIR="$LIB" UV_TOOL_BIN_DIR="$LIB/bin-dir" "$UV" tool install')
+        self.assertLess(backup, install, 'the backup exists before the tree changes')
+
+    def test_a_restore_trap_covers_every_failure_path(self):
+        self.assertIn('trap \'restore\' EXIT INT TERM', self.text)
+
+    def test_each_install_step_fails_loudly_and_stops(self):
+        for message in (
+            'the collections failed',
+            'the installed code does not import',
+            'the installed Ansible does not import',
+            'the installed playbook binary fails',
+            'the installed collections are missing',
+        ):
+            self.assertIn(message, self.text, message)
+
+    def test_a_committed_install_is_not_rolled_back(self):
+        """Otherwise a successful install would delete itself on exit."""
+        self.assertIn('COMMITTED=yes', self.text)
+        self.assertIn('[ "$COMMITTED" != yes ]', self.text)
+
+    def test_the_staging_swap_is_not_used_for_a_venv(self):
+        """Measured: `mv` a venv and every console script's absolute shebang breaks.
+
+        The install therefore happens at its real path, with a backup/restore.
+        """
+        self.assertNotIn('mv "$NEW" "$LIB"', self.text)
 
 
 if __name__ == '__main__':

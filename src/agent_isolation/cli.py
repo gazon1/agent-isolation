@@ -497,6 +497,80 @@ class Ansible:
     def __init__(self, cfg: Config, runner: Runner):
         self.cfg = cfg
         self.runner = runner
+        #: Generated configs and temp dirs, removed once the playbook has returned.
+        self._configs: list[Path] = []
+
+    #: Everything Ansible would let the CALLER redirect through the environment.
+    #: `ANSIBLE_CONFIG`, the plugin and module paths, and the collection path are
+    #: the ones that load code; the rest are dropped for tidiness.
+    _CALLER_ANSIBLE_VARS = (
+        "ANSIBLE_CONFIG",
+        "ANSIBLE_HOME",
+        "ANSIBLE_COLLECTIONS_PATH",
+        "ANSIBLE_COLLECTIONS_PATHS",
+        "ANSIBLE_LIBRARY",
+        "ANSIBLE_ACTION_PLUGINS",
+        "ANSIBLE_CALLBACK_PLUGINS",
+        "ANSIBLE_CONNECTION_PLUGINS",
+        "ANSIBLE_FILTER_PLUGINS",
+        "ANSIBLE_LOOKUP_PLUGINS",
+        "ANSIBLE_INVENTORY_PLUGINS",
+        "ANSIBLE_MODULE_UTILS",
+        "ANSIBLE_BECOME_EXE",
+        "ANSIBLE_PYTHON_INTERPRETER",
+    )
+
+    def _environment(self) -> dict[str, str]:
+        """The environment the privileged playbook runs in: built, not inherited.
+
+        Measured: with an `ansible.cfg` in the current directory setting
+        `library = ./plugins`, `ansible-playbook` loaded a module from it and ran
+        that module's code. The cwd is inherited by `subprocess.run`, and Ansible's
+        config search includes `ANSIBLE_CONFIG`, `./ansible.cfg`, `~/.ansible.cfg`
+        and `/etc/ansible/ansible.cfg` — two of those can be the caller's.
+
+        So: a generated root-only config, named explicitly, the caller's env
+        variables removed, and the plugin/collection paths that the installation
+        owns set as the only ones.
+        """
+        env = {k: v for k, v in self.runner.env.items() if k not in self._CALLER_ANSIBLE_VARS}
+        # NOT LC_ALL=C, which every other subprocess here wants: Ansible refuses to
+        # start without a UTF-8 locale ("Detected None"). The playbook parses no
+        # localized tool output, so the one setting cannot make it misread anything.
+        env.pop("LC_ALL", None)
+        env["LANG"] = env.get("LANG") if (env.get("LANG") or "").upper().endswith(("UTF-8", "UTF8")) else "C.UTF-8"
+        env["LC_ALL"] = env["LANG"]
+        env["ANSIBLE_CONFIG"] = str(self._config_file())
+        if self.cfg.ansible_collections_path:
+            env["ANSIBLE_COLLECTIONS_PATH"] = self.cfg.ansible_collections_path
+        # Ansible writes its temp files under the target's HOME; root's is not the
+        # caller's, and a read-only or absent one fails the run.
+        env.setdefault("ANSIBLE_LOCAL_TEMP", tempfile.mkdtemp(prefix="agent-account-ansible-"))
+        env.setdefault("ANSIBLE_REMOTE_TEMP", env["ANSIBLE_LOCAL_TEMP"])
+        return env
+
+    def _config_file(self) -> Path:
+        """A root-only `ansible.cfg` holding the installation's plugin paths.
+
+        Written with `mkstemp` (0600) rather than a predictable name, for the same
+        reason the sudoers file is: a pre-existing path must not be trusted or
+        clobbered.
+        """
+        fd, name = tempfile.mkstemp(prefix="agent-account-ansible-", suffix=".cfg")
+        path = Path(name)
+        self._configs.append(path)
+        collections = self.cfg.ansible_collections_path
+        lines = [
+            "[defaults]",
+            # No library or plugin path is derived from anything but the install.
+            "action_warnings = False",
+            f"collections_path = {collections}" if collections else "",
+            # Ansible must not read a config from the caller's HOME either.
+            "remote_tmp = $HOME/.ansible/tmp",
+        ]
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(line for line in lines if line) + "\n")
+        return path
 
     def run(self, variables: Mapping[str, object], check: bool = False) -> None:
         argv = [
@@ -507,19 +581,7 @@ class Ansible:
         ]
         if check:
             argv += ["--check", "--diff"]
-        env = dict(self.runner.env)
-        # NOT LC_ALL=C, which every other subprocess here wants: Ansible refuses to
-        # start without a UTF-8 locale ("Detected None"). The playbook parses no
-        # localized tool output, so the one setting cannot make it misread anything.
-        env.pop("LC_ALL", None)
-        env["LANG"] = env.get("LANG") if (env.get("LANG") or "").upper().endswith(("UTF-8", "UTF8")) else "C.UTF-8"
-        env["LC_ALL"] = env["LANG"]
-        if self.cfg.ansible_collections_path:
-            env["ANSIBLE_COLLECTIONS_PATH"] = self.cfg.ansible_collections_path
-        # Ansible writes its temp files under the target's HOME; root's is not the
-        # caller's, and a read-only or absent one fails the run.
-        env.setdefault("ANSIBLE_LOCAL_TEMP", tempfile.mkdtemp(prefix="agent-account-ansible-"))
-        env.setdefault("ANSIBLE_REMOTE_TEMP", env["ANSIBLE_LOCAL_TEMP"])
+        env = self._environment()
 
         with tempfile.NamedTemporaryFile(
             "w", prefix="agent-account-vars-", suffix=".json", delete=False, encoding="utf-8"
@@ -529,10 +591,16 @@ class Ansible:
         os.chmod(vars_path, 0o600)
         argv += ["-e", f"@{vars_path}"]
         try:
-            result = subprocess.run(argv, env=env, check=False)
+            # `cwd` is explicit: Ansible's config search includes `./ansible.cfg`,
+            # so inheriting the caller's directory is itself the vulnerability.
+            result = subprocess.run(argv, env=env, cwd=env["ANSIBLE_LOCAL_TEMP"], check=False)
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(vars_path)
+            for path in self._configs:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+            self._configs.clear()
         if result.returncode != 0:
             raise AgentAccountError(f"the playbook failed ({result.returncode}): {' '.join(shlex.quote(a) for a in argv)}")
 
