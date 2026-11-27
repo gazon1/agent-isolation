@@ -1,0 +1,14 @@
+---
+# agent_isolation/ansible/requirements.yml — the collections the playbook needs.
+#
+# `install.sh` runs this into the tool's own collection directory, root-owned, so
+# the elevated playbook never reads a collection from a checkout or a user home:
+#
+#   ansible-galaxy collection install -r requirements.yml -p /usr/local/lib/agent-isolation/collections
+#
+# Only one collection is needed, and it is not in ansible-core: `ansible.posix`
+# ships the `acl` module. Kept here rather than in mise.toml because mise has no
+# galaxy backend, so a pin there would silently resolve to nothing.
+collections:
+  - name: ansible.posix
+    version: "2.2.2"
