@@ -306,17 +306,44 @@ class Result:
 
 
 TRUSTED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+TRUSTED_TMP_PARENT = Path("/var/lib/agent-isolation")
+
+
+def trusted_tmp_parent() -> Path:
+    """Root-controlled parent for privileged temporary files.
+
+    Inherited TMPDIR may be writable by the caller (or be in a non-sticky world-
+    writable directory), which makes temp file names replaceable. Privileged
+    config/vars/staging must live under a trusted, root-owned 0700 parent.
+    """
+    override = os.environ.get("AGENT_ISOLATION_TRUSTED_TMP")
+    parent = Path(override) if override else TRUSTED_TMP_PARENT
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise AgentAccountError(f"cannot create trusted temp parent {parent}: {error}") from error
+    try:
+        st = os.lstat(parent)
+    except OSError as error:
+        raise AgentAccountError(f"cannot stat trusted temp parent {parent}: {error}") from error
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise AgentAccountError(f"trusted temp parent {parent} is not a directory")
+    if st.st_uid != 0:
+        raise AgentAccountError(f"trusted temp parent {parent} is owned by uid {st.st_uid}, not root")
+    if st.st_mode & 0o077:
+        raise AgentAccountError(f"trusted temp parent {parent} must not be group/world accessible")
+    return parent
 
 
 def _safe_subprocess_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """A minimal environment for privileged or security-sensitive subprocesses.
 
-    The caller's environment is untrusted: PATH/PYTHON*/UV*/GIT*/ANSIBLE* can
-    redirect binary or module resolution. We keep a small allowlist and set a
-    fixed PATH and locale.
+    The caller's environment is untrusted: PATH/PYTHON*/UV*/GIT*/ANSIBLE*/TMPDIR
+    can redirect binary, module, or temp-file resolution. We keep a small
+    allowlist and set fixed PATH/locale/TMPDIR.
     """
     base = dict(os.environ if environ is None else environ)
-    allowed = {"HOME", "LANG", "LC_CTYPE", "LC_MESSAGES", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TZ", "USER"}
+    allowed = {"HOME", "LANG", "LC_CTYPE", "LC_MESSAGES", "LOGNAME", "SHELL", "TERM", "TZ", "USER"}
     env: dict[str, str] = {}
     for key, value in base.items():
         if key in allowed and not key.startswith(("ANSIBLE_", "GIT_", "PYTHON", "UV_")):
@@ -327,6 +354,7 @@ def _safe_subprocess_env(environ: Mapping[str, str] | None = None) -> dict[str, 
         lang = "C.UTF-8"
     env["LANG"] = lang
     env["LC_ALL"] = "C"
+    env["TMPDIR"] = str(trusted_tmp_parent())
     return env
 
 
@@ -525,6 +553,12 @@ class Ansible:
         #: Generated temp dirs, removed once the playbook has returned.
         self._tempdirs: list[Path] = []
 
+    def _trusted_tempdir(self) -> Path:
+        tempdir = Path(tempfile.mkdtemp(prefix="agent-account-ansible-", dir=trusted_tmp_parent()))
+        os.chmod(tempdir, 0o700)
+        self._tempdirs.append(tempdir)
+        return tempdir
+
     def _environment(self) -> dict[str, str]:
         """The environment the privileged playbook runs in: built, not inherited.
 
@@ -545,25 +579,22 @@ class Ansible:
         env.pop("LC_ALL", None)
         env["LANG"] = env.get("LANG") if (env.get("LANG") or "").upper().endswith(("UTF-8", "UTF8")) else "C.UTF-8"
         env["LC_ALL"] = env["LANG"]
-        env["ANSIBLE_CONFIG"] = str(self._config_file())
-        if self.cfg.ansible_collections_path:
-            env["ANSIBLE_COLLECTIONS_PATH"] = self.cfg.ansible_collections_path
-        # Ansible writes temp files; caller-supplied temp dirs are untrusted.
-        tempdir = Path(tempfile.mkdtemp(prefix="agent-account-ansible-"))
-        os.chmod(tempdir, 0o700)
-        self._tempdirs.append(tempdir)
+        tempdir = self._trusted_tempdir()
         env["ANSIBLE_LOCAL_TEMP"] = str(tempdir)
         env["ANSIBLE_REMOTE_TEMP"] = str(tempdir)
+        env["TMPDIR"] = str(tempdir)
+        env["ANSIBLE_CONFIG"] = str(self._config_file(tempdir))
+        if self.cfg.ansible_collections_path:
+            env["ANSIBLE_COLLECTIONS_PATH"] = self.cfg.ansible_collections_path
         return env
 
-    def _config_file(self) -> Path:
+    def _config_file(self, tempdir: Path) -> Path:
         """A root-only `ansible.cfg` holding the installation's plugin paths.
 
-        Written with `mkstemp` (0600) rather than a predictable name, for the same
-        reason the sudoers file is: a pre-existing path must not be trusted or
-        clobbered.
+        Written inside the trusted temp directory so the directory entry cannot be
+        replaced through an inherited/caller-controlled TMPDIR.
         """
-        fd, name = tempfile.mkstemp(prefix="agent-account-ansible-", suffix=".cfg")
+        fd, name = tempfile.mkstemp(prefix="ansible-", suffix=".cfg", dir=tempdir)
         path = Path(name)
         self._configs.append(path)
         collections = self.cfg.ansible_collections_path
@@ -593,8 +624,9 @@ class Ansible:
         run_error: BaseException | None = None
         try:
             env = self._environment()
+            tempdir = Path(env["ANSIBLE_LOCAL_TEMP"])
             with tempfile.NamedTemporaryFile(
-                "w", prefix="agent-account-vars-", suffix=".json", delete=False, encoding="utf-8"
+                "w", prefix="vars-", suffix=".json", delete=False, encoding="utf-8", dir=tempdir
             ) as handle:
                 vars_path = handle.name
                 json.dump(variables, handle, indent=2, sort_keys=True)

@@ -193,6 +193,32 @@ CLEANUP_STATUS=0
 CLEANUP_DONE=no
 LIB_PREEXISTING=no
 LIB_CREATED=no
+SECURE_TMPROOT=""
+
+secure_tmp_root() {
+    # Inherited TMPDIR is caller-controlled. Privileged staging/backup must live
+    # under a trusted, root-controlled parent that we create and validate.
+    if [ -n "${SECURE_TMPROOT:-}" ]; then
+        printf '%s\n' "$SECURE_TMPROOT"
+        return 0
+    fi
+    local_parent=${AGENT_ISOLATION_INSTALL_TMPROOT:-/var/lib/agent-isolation}
+    install -d -m 0700 -o root -g root "$local_parent"
+    assert_trusted "$local_parent"
+    SECURE_TMPROOT=$(TMPDIR= mktemp -d "$local_parent/install-tmp.XXXXXX")
+    chown root:root "$SECURE_TMPROOT"
+    chmod 0700 "$SECURE_TMPROOT"
+    assert_trusted "$SECURE_TMPROOT"
+    printf '%s\n' "$SECURE_TMPROOT"
+}
+
+secure_mktemp_dir() {
+    dir=$(TMPDIR= mktemp -d "$(secure_tmp_root)/$1.XXXXXX")
+    chown root:root "$dir"
+    chmod 0700 "$dir"
+    assert_trusted "$dir"
+    printf '%s\n' "$dir"
+}
 
 cleanup() {
     CLEANUP_STATUS=$?
@@ -205,6 +231,7 @@ cleanup() {
     if [ "${COMMITTED:-no}" = yes ]; then
         [ -n "${STAGE:-}" ] && rm -rf -- "$STAGE"
         [ -n "${WORK:-}" ] && rm -rf -- "$WORK"
+        [ -n "${SECURE_TMPROOT:-}" ] && rmdir -- "$SECURE_TMPROOT" 2>/dev/null || true
         exit "$CLEANUP_STATUS"
     fi
     if [ "${INSTALL_STARTED:-no}" = yes ] && [ "${BACKUP_READY:-no}" = yes ] && [ -n "${BACKUP:-}" ] && [ -d "$BACKUP" ]; then
@@ -214,6 +241,7 @@ cleanup() {
             BACKUP=""
             [ -n "${STAGE:-}" ] && rm -rf -- "$STAGE"
             [ -n "${WORK:-}" ] && rm -rf -- "$WORK"
+            [ -n "${SECURE_TMPROOT:-}" ] && rmdir -- "$SECURE_TMPROOT" 2>/dev/null || true
         else
             echo "install.sh: COULD NOT ROLL BACK; the previous tree is at $BACKUP" >&2
             echo "install.sh: staging directory preserved at $STAGE" >&2
@@ -225,6 +253,7 @@ cleanup() {
         rm -rf -- "$LIB"
         [ -n "${STAGE:-}" ] && rm -rf -- "$STAGE"
         [ -n "${WORK:-}" ] && rm -rf -- "$WORK"
+        [ -n "${SECURE_TMPROOT:-}" ] && rmdir -- "$SECURE_TMPROOT" 2>/dev/null || true
     else
         # Install never started mutating $LIB. If this run created $LIB for a
         # first install, remove that empty directory; leave pre-existing installs
@@ -234,6 +263,7 @@ cleanup() {
         fi
         [ -n "${STAGE:-}" ] && rm -rf -- "$STAGE"
         [ -n "${WORK:-}" ] && rm -rf -- "$WORK"
+        [ -n "${SECURE_TMPROOT:-}" ] && rmdir -- "$SECURE_TMPROOT" 2>/dev/null || true
     fi
     exit "$CLEANUP_STATUS"
 }
@@ -254,9 +284,9 @@ fi
 install -d -m 0755 -o root -g root "$LIB"
 
 # The builder runs as the CALLER and must be able to write its output here, so the
-# directory is owned by that user. `mktemp -d` alone is 0700 root, which made the
-# build fail with a bare "failed" — measured.
-WORK=$(mktemp -d)
+# directory is owned by that user. The parent tmp root is trusted/root-only; WORK
+# itself is a dedicated builder-owned subdirectory inside it.
+WORK=$(secure_mktemp_dir work)
 chown "$BUILD_USER:$BUILD_GROUP" "$WORK"
 chmod 0755 "$WORK"
 
@@ -326,8 +356,7 @@ fi
 # symlink. After the rename all of them point into a deleted staging path, so the
 # command is dead. Installing at the real path and rolling back on failure avoids
 # the whole class.
-STAGE=$(mktemp -d)
-chmod 0755 "$STAGE"
+STAGE=$(secure_mktemp_dir stage)
 
 # Keep the previous tree aside. `$LIB` may not exist on a first install.
 if [ -L "$LIB" ] || { [ -e "$LIB" ] && [ ! -d "$LIB" ]; }; then
