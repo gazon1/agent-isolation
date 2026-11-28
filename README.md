@@ -20,14 +20,20 @@ $ sudo agent-account rollback                  # undo what apply wrote
 
 | Resource | Detail |
 |---|---|
-| user `agent` | no password (no login), a real shell, in none of `wheel`/`docker`/`kvm` |
-| group `agent-dev` | narrow: the developer and `agent`. The collaboration seam for authorized worktrees |
+| user `agent` | **locked** password — not merely absent, which is not the same thing under `nullok` — a real shell, in none of `wheel`/`docker`/`kvm` |
+| group `agent-dev` | narrow: the developer **and** `agent` — both are required, and `check` fails when either is missing. The collaboration seam for authorized worktrees |
 | ACLs | `--x` to traverse the developer home (path access, **never** a listing); `rX` + default `rX` on configured read-only trees; `rwX` + default `rwX` on authorized worktree roots and the shared Git directory |
 | sudoers | one rule, and it is the **developer's**: re-execute `/usr/bin/env` AS `agent`. The agent holds no sudo right at all |
 
 The agent cannot write Git config or hooks: `.git/config` and `.git/hooks` are explicitly
 denied, and the grant is on the common Git directory (which a linked worktree does not
 carry) so commits still work.
+
+An **adopted** account whose `passwd --status` reads `P` (usable password) or `NP` (no
+password at all) is locked by `apply`; `NP` matters because a PAM stack with `nullok`
+accepts it as a login. `L` is left alone. A status that cannot be read is a refusal, not
+a silent skip, and `rollback` restores the recorded original — `P` and `NP` are unlocked
+back, `L` is never unlocked.
 
 ### What a worktree root may contain
 
@@ -222,7 +228,15 @@ worktree grants and the sudoers rule alone.
 
 ### Compatibility
 
-- **Python ≥ 3.12** (the pinned `ansible-core` requires it), Linux with ACL support. SELinux is *queried* by `check`, not configured.
+- **Python 3.12–3.15**, Linux with ACL support. SELinux is *queried* by `check`, not configured.
+  `ansible-core` is a range rather than a pin because no single version covers that span:
+  2.21.x cannot run its own entry points on Python 3.15 (`ansible-galaxy --version` and
+  `ansible-playbook --version` die with `AttributeError: module 'dataclasses' has no
+  attribute '_is_type'`, while `import ansible` still succeeds), and 2.22.0 needs
+  Python ≥ 3.13. The committed lock resolves **both** with `python_full_version` markers,
+  so one hashed requirements file installs the right one for the host — 2.22.0 on 3.13+,
+  2.21.x below — and `install.sh` refuses an interpreter outside 3.12–3.15 up front
+  instead of failing later inside Ansible.
 - The journal in `/var/lib/agent-account` is read by shape: a state file written by the
   pre-extraction `sing` script is still understood, so a host can be adopted without
   re-provisioning.
@@ -251,8 +265,16 @@ the lock resolve over the network". So there is a second suite that boots Fedora
 under KVM and runs the shipped script as root, with nothing stubbed in the guest:
 
 ```console
-$ AGENT_ISOLATION_VM_TEST=1 python3 -m unittest tests.test_vm_install -v
+$ AGENT_ISOLATION_CONTAINER_TEST=1 python3 -m unittest tests.test_container_install -v   # ~2 min
+$ AGENT_ISOLATION_VM_TEST=1        python3 -m unittest tests.test_vm_install -v          # ~5 min
 ```
+
+These are a pair, and the split is not arbitrary. The **container** suite is the filter:
+real root, real `chown`, real `runuser`, a real network, one throwaway container reused by
+every case. The **VM** suite is the authority. A container cannot answer what the VM can —
+recorded example: Fedora Cloud ships `/` at 0775 while the container image has 0755, so the
+"install is impossible on a stock image" bug was invisible in the container and only the VM
+caught it. Run the container one first, the VM one before release.
 
 It is opt-in and skips without that variable, so the ordinary suite stays fast and
 offline. It needs `/dev/kvm`, `qemu-system-x86_64`, `genisoimage` and `ssh`, and downloads
@@ -262,6 +284,7 @@ destroyed afterwards even on failure.
 
 | Variable | Meaning |
 |---|---|
+| `AGENT_ISOLATION_CONTAINER_TEST` | opt in to the fast container suite |
 | `AGENT_ISOLATION_VM_IMAGE` | use this local qcow2 instead of downloading |
 | `AGENT_ISOLATION_VM_IMAGE_SHA256` | verify that image (required for a non-default URL) |
 | `AGENT_ISOLATION_VM_CACHE` | where the download is cached |
@@ -282,7 +305,8 @@ src/agent_isolation/
   ansible/requirements.yml    the pinned collection
 tests/test_agent_account.py   the suite
 tests/test_install_sh.py      install.sh, with root operations shimmed
-tests/test_vm_install.py      install.sh end to end on a booted VM (opt-in)
+tests/test_container_install.py  install.sh end to end in a container (opt-in, fast)
+tests/test_vm_install.py      install.sh end to end on a booted VM (opt-in, authoritative)
 tests/vm_harness.py           the cloud-init/KVM harness that suite uses
 install.sh                    the root-owned install
 ```

@@ -130,6 +130,14 @@ class FakeRunner(aa.Runner):
     #: argv prefixes and the Result they answer with
     responses = ()
 
+    #: A `passwd --status` answer for every host that does not override it.
+    #:
+    #: The default `Result(0, '', '')` is a lie for this one command: real `passwd`
+    #: always prints `<name> <state> <date>`, and the tool now REFUSES an empty
+    #: answer instead of silently scheduling no lock. A test about snapshots or
+    #: ACLs should not have to know that, so the realistic default lives here.
+    PASSWD_DEFAULT = 'agent P 01/01/2026\n'
+
     def __init__(self, dry_run=False):
         super().__init__(dry_run=dry_run, environ={'PATH': '/usr/bin:/bin'})
         self.executed = []
@@ -140,6 +148,8 @@ class FakeRunner(aa.Runner):
         for prefix, result in self.responses:
             if argv[: len(prefix)] == list(prefix):
                 return result
+        if argv[:2] == ['passwd', '--status']:
+            return aa.Result(0, self.PASSWD_DEFAULT, '')
         return aa.Result(0, '', '')
 
     def commands(self):
@@ -737,6 +747,143 @@ class JournalTest(Base):
         self.assertEqual('P', saved.passwd)
 
 
+class PasswordStateTest(Base):
+    """`passwd --status` is three states, and only two of them may be left alone.
+
+    `P` is a usable password. `NP` is NO password — which is not "locked": a PAM
+    stack with `nullok` accepts it as a login, so it is locked exactly like `P`.
+    `L` is already locked and must be left untouched, or rollback's record of the
+    original state becomes a record of something `apply` wrote.
+
+    An answer that cannot be read is a REFUSAL. The old code ignored the return code
+    and looked only for `P`, so an unreadable or malformed state silently scheduled
+    no lock and the account kept its access.
+    """
+
+    def _updates(self, ctx):
+        store = aa.StateStore(self.tmp / 'state')
+        provisioner = aa.Provisioner(ctx, store)
+        return provisioner._record_memberships(ctx.accounts.passwd(AGENT), [])
+
+    def _locked(self, ctx) -> bool:
+        return any(u.get('password_lock') is True for u in self._updates(ctx))
+
+    def test_a_usable_password_is_locked(self):
+        ctx = self.context()
+        ctx.runner.responses = ((('passwd', '--status'), aa.Result(0, 'agent P 01/01/2026\n', '')),)
+        self.assertTrue(self._locked(ctx))
+
+    def test_a_passwordless_account_is_locked(self):
+        """The state the old code let through: NP is not L."""
+        ctx = self.context()
+        ctx.runner.responses = ((('passwd', '--status'), aa.Result(0, 'agent NP\n', '')),)
+        self.assertTrue(self._locked(ctx),
+                        'an adopted NP account must be locked — NP is a login under nullok')
+
+    def test_an_already_locked_account_is_left_alone(self):
+        ctx = self.context()
+        ctx.runner.responses = ((('passwd', '--status'), aa.Result(0, 'agent L 01/01/2026\n', '')),)
+        self.assertFalse(self._locked(ctx), 're-locking a locked account is not ours to schedule')
+
+    def test_an_unreadable_status_refuses_instead_of_scheduling_nothing(self):
+        for label, result in {
+            'non-zero exit': aa.Result(1, '', 'passwd: permission denied'),
+            'empty answer': aa.Result(0, '', ''),
+            'unknown state': aa.Result(0, 'agent X 01/01/2026\n', ''),
+            'truncated': aa.Result(0, 'agent\n', ''),
+        }.items():
+            with self.subTest(label):
+                ctx = self.context()
+                ctx.runner.responses = ((('passwd', '--status'), result),)
+                with self.assertRaises(aa.AgentAccountError) as caught:
+                    self._updates(ctx)
+                self.assertIn('password state', str(caught.exception))
+
+    def test_the_original_state_is_journalled_for_P_and_NP(self):
+        # A fresh store per state: `record_passwd` is first-write-wins by design, so
+        # reusing one would record the FIRST baseline and prove nothing about NP.
+        for index, code in enumerate(('P', 'NP')):
+            with self.subTest(code):
+                ctx = self.context()
+                ctx.runner.responses = (
+                    (('passwd', '--status'), aa.Result(0, f'agent {code} 01/01/2026\n', '')),
+                )
+                store = aa.StateStore(self.tmp / f'state-{index}')
+                self.quiet(aa.Provisioner(ctx, store).apply)
+                saved = aa.State.from_json(store.path.read_text())
+                self.assertEqual(code, saved.passwd)
+
+    def test_an_unreadable_state_refuses_apply_before_any_write(self):
+        ctx = self.context()
+        ctx.runner.responses = ((('passwd', '--status'), aa.Result(1, '', 'passwd: permission denied')),)
+        store = aa.StateStore(self.tmp / 'state')
+        with self.assertRaises(aa.AgentAccountError):
+            self.quiet(aa.Provisioner(ctx, store).apply)
+        self.assertEqual([], ctx.ansible.calls, 'the playbook ran before the state was known')
+        self.assertFalse((self.tmp / 'sudoers').exists())
+
+
+class PasswordRollbackTest(Base):
+    """Rollback restores the ORIGINAL state, and never unlocks what it did not lock."""
+
+    def _rollback(self, baseline: str, current: str) -> tuple[list[dict], str]:
+        """Returns (the playbook's account updates, stdout + stderr).
+
+        Both streams: the restoration message is stdout, the `nullok` caution is
+        stderr, and a test that looked at one of them would miss half the contract.
+        """
+        ctx = self.context()
+        ctx.runner.responses = ((('passwd', '--status'), aa.Result(0, f'agent {current} 01/01/2026\n', '')),)
+        store = aa.StateStore(self.tmp / 'state')
+        store.save(aa.State(owned={'user': 'adopted', 'group': 'adopted'}, passwd=baseline))
+        rollback = aa.Rollback(ctx, store)
+        _, out, err = self.quiet(rollback._account_and_groups, ctx.accounts.passwd(AGENT))
+        return ctx.ansible.variables['agent_user_updates'], out + err
+
+    def test_a_baseline_of_P_is_unlocked(self):
+        updates, out = self._rollback('P', 'L')
+        self.assertTrue(any(u.get('password_lock') is False for u in updates))
+        self.assertIn('unlocking', out)
+
+    def test_a_baseline_of_NP_is_restored_to_empty_not_unlocked(self):
+        """Restoring NP is correct — it is what was there — but it must be loud,
+        because the account returns to a state `nullok` treats as a login.
+
+        And it is NOT `password_lock: false`: measured on Fedora 43, `usermod`
+        refuses that with "unlocking the user's password would result in a
+        passwordless account", because a passwordless `L` carries no hash to restore.
+        """
+        updates, out = self._rollback('NP', 'L')
+        self.assertTrue(any(u.get('password_unlock_to_empty') is True for u in updates),
+                        'NP must be restored with an empty password')
+        self.assertFalse(any(u.get('password_lock') is False for u in updates),
+                         'password_lock: false cannot restore NP — usermod refuses it')
+        self.assertIn('NO password before apply', out)
+        self.assertIn('nullok', out)
+
+    def test_the_playbook_restores_empty_without_password_lock(self):
+        """The task that does it must exist, and must not go through `user`."""
+        playbook = (REPO_ROOT / 'src/agent_isolation/ansible/agent-account.yml').read_text(encoding='utf-8')
+        self.assertIn('Restore an account that had no password before apply', playbook)
+        self.assertIn('password_unlock_to_empty', playbook)
+        # It runs a real command as root, so it must be `command` with an argv list,
+        # never `shell` with a string the account name could break out of.
+        self.assertIn('ansible.builtin.command:', playbook)
+        self.assertIn('- usermod', playbook)
+        self.assertNotIn('--password ", "', playbook, 'the empty password must not be a shell string')
+
+    def test_a_baseline_of_L_is_never_unlocked(self):
+        """The regression: an account locked BEFORE this tool must stay locked."""
+        updates, out = self._rollback('L', 'L')
+        self.assertFalse(any(u.get('password_lock') is False for u in updates),
+                         'rollback unlocked an account that was locked before apply')
+        self.assertNotIn('unlocking', out)
+
+    def test_an_already_unlocked_account_is_not_unlocked_again(self):
+        updates, _ = self._rollback('P', 'P')
+        self.assertFalse(any(u.get('password_lock') is False for u in updates))
+
+
 class MembershipTest(Base):
     """The seam is both identities and nobody else — and the developer only gains."""
 
@@ -860,6 +1007,26 @@ class PolicyDocumentationTest(unittest.TestCase):
             with self.subTest(phrase):
                 self.assertIn(phrase, section)
         self.assertIn('check', section, 'the check half of the invariant is documented')
+
+    def test_the_seam_is_documented_as_both_identities(self):
+        """A README that describes the group as optional for the developer would
+        contradict a `check` that fails on it."""
+        row = next(
+            line for line in self.readme.splitlines()
+            if line.startswith('| group `agent-dev`')
+        )
+        self.assertIn('developer', row)
+        self.assertIn('both', row.lower())
+        self.assertIn('fails', row)
+
+    def test_the_password_policy_is_documented(self):
+        """`NP` is the case the old code missed, so the README must name it."""
+        self.assertIn('adopted', self.readme)
+        self.assertIn('NP', self.readme)
+        self.assertIn('nullok', self.readme)
+        self.assertIn('locked', self.readme)
+        # And the claim it replaces must be gone: "no password" is not "no login".
+        self.assertNotIn('no password (no login)', self.readme)
 
 
 class AdoptedHomeTest(Base):
@@ -1853,6 +2020,50 @@ class CheckTest(Base):
         with redirect_stdout(out), redirect_stderr(err):
             rc = checker._verdict()
         return rc, out.getvalue() + err.getvalue()
+
+    def test_the_developer_missing_from_the_seam_is_a_FAILURE_not_a_note(self):
+        """The agent alone in the group is a half-formed seam, not a transition.
+
+        `groups_of` reads NSS, so this is a fact about the host rather than a
+        stale login session. The old NOTE said otherwise and `_verdict` ignored
+        NOTE, so `check` printed "every invariant holds" and exited 0 for a host
+        where the collaboration group held nobody to collaborate with.
+        """
+        ctx = self.context(seam_members=(AGENT,))  # the developer is NOT in it
+        checker = self._checker(ctx)
+        checker.report = aa.Report()
+        _, out, _ = self.quiet(checker._seam)
+        self.assertIn('FAIL', out)
+        self.assertIn(DEV, out)
+        self.assertIn('collaboration seam', out)
+        self.assertNotIn('NOTE', out, 'a missing seam is not a note')
+
+    def test_check_cannot_exit_0_when_the_developer_is_missing_from_the_seam(self):
+        """The acceptance criterion, through the real `run()` and its summary."""
+        ctx = self._provisioned_context(seam_members=(AGENT,), roots=(self.wt,))
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'),
+             aa.Result(0, 'User agent is not allowed to run sudo on host.\n', '')),
+        ) + tuple(ctx.runner.responses)
+        checker = self._checker(ctx)
+        self._stub_agent_probes(checker)
+        rc, out = self._run_full(checker)
+        self.assertEqual(1, rc, out)
+        self.assertNotIn('every invariant holds', out)
+        self.assertIn('does not hold ' + DEV, out)
+
+    def test_a_complete_seam_still_passes(self):
+        """The other half: the failure is specific, not "always"."""
+        ctx = self._provisioned_context(roots=(self.wt,))
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'),
+             aa.Result(0, 'User agent is not allowed to run sudo on host.\n', '')),
+        ) + tuple(ctx.runner.responses)
+        checker = self._checker(ctx)
+        self._stub_agent_probes(checker)
+        rc, out = self._run_full(checker)
+        self.assertEqual(0, rc, out)
+        self.assertIn(f'both identities are in {SEAM}', out)
 
     def test_a_sudo_rule_for_the_agent_is_a_failure(self):
         ctx = self.context()

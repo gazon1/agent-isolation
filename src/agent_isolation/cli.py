@@ -158,6 +158,12 @@ PLAYBOOK = Path(__file__).resolve().parent / "ansible" / "agent-account.yml"
 # Root-equivalent or device-owning. `docker` alone defeats every file permission;
 # `disk` exposes block devices, `lxd`/`incus-admin` grant container-root paths.
 PRIVILEGED_GROUPS = ("wheel", "docker", "kvm", "disk", "lxd", "incus-admin")
+#: The `passwd --status` states this tool understands. P and NP are both usable
+#: credentials and both get locked; L is already locked and is left alone.
+PASSWORD_STATES = ("P", "L", "NP")
+#: The subset that `apply` must lock. NP at the end of a pipe is not "locked",
+#: it is "no password" — one `nullok` PAM line away from a login.
+LOCKABLE_PASSWORD_STATES = ("P", "NP")
 SUDO_COMMAND = "/usr/bin/env"
 DEFAULT_STATE_DIR = Path("/var/lib/agent-account")
 DEFAULT_SUDOERS_PATH = Path("/etc/sudoers.d/50-agent-account")
@@ -1278,6 +1284,39 @@ def dump_paths(dump: str) -> set[str]:
     return {getfacl_unescape(line[len("# file: ") :]) for line in dump.split("\n") if line.startswith("# file: ")}
 
 
+def parse_password_status(result: "Result", name: str) -> str:
+    """`passwd --status` as one of P/L/NP, or a refusal.
+
+    The three states are not interchangeable and the difference is the whole
+    boundary:
+
+    * `P` — a usable password. `apply` locks it.
+    * `NP` — NO password at all. This is NOT "already safe": on a PAM stack that
+      permits empty passwords (`nullok`) it is a login, and the account is reachable
+      without a secret. It is locked like `P`.
+    * `L` — locked. Left alone, because re-locking is a no-op that would overwrite
+      the journal's record of the ORIGINAL state.
+
+    Anything else — a non-zero exit, an unparseable line, a state this code does not
+    know — REFUSES. The previous version ignored the return code and only looked for
+    `P`, so an unreadable or malformed answer silently scheduled no lock at all and
+    the account kept whatever access it had.
+    """
+    if result.rc != 0:
+        detail = (result.err or result.out).strip() or f"exit {result.rc}"
+        raise AgentAccountError(
+            f"cannot read {name}'s password state ({detail}); refusing to guess whether it must be locked"
+        )
+    parts = result.out.split()
+    state = parts[1] if len(parts) > 1 else ""
+    if state not in PASSWORD_STATES:
+        raise AgentAccountError(
+            f"cannot read {name}'s password state: `passwd --status` answered {result.out.strip()!r}, "
+            f"expected one of {'/'.join(PASSWORD_STATES)}"
+        )
+    return state
+
+
 def parse_sudo_rules(text: str) -> list[str]:
     """The rule lines of `sudo -l`: those after "may run the following commands".
 
@@ -1924,11 +1963,14 @@ class Provisioner:
 
         # "No password, so no login" is the invariant, and a NEW account has it by
         # construction — an existing one may not. The state before the lock is
-        # recorded, because a lock is not undone by symmetry either.
-        status = self.runner.capture("passwd", "--status", cfg.agent_user).out.split()
-        password_state = status[1] if len(status) > 1 else ""
-        if password_state:
-            self.journal.passwd(password_state)
+        # recorded, because a lock is not undone by symmetry either. An unreadable
+        # or unknown state refuses here: this is the record rollback restores from,
+        # and a guessed baseline would unlock an account that was never locked.
+        self.journal.passwd(
+            parse_password_status(
+                self.runner.capture("passwd", "--status", cfg.agent_user), cfg.agent_user
+            )
+        )
 
         # A pre-existing account that still holds a privileged group is the whole
         # boundary defeated — `docker` alone is root-equivalent. `apply` is what a
@@ -1992,8 +2034,15 @@ class Provisioner:
                 # The new primary group has to exist; an account somebody else
                 # created may not have one of its own.
                 updates.append({"name": cfg.agent_user, "primary_group": cfg.agent_user})
-            status = self.runner.capture("passwd", "--status", cfg.agent_user).out.split()
-            if len(status) > 1 and status[1] == "P":
+            # BOTH usable states are locked, and `NP` is the one that used to slip
+            # through: "no password" is not "locked", it is one `nullok` line in the
+            # PAM stack away from a login. `L` is left untouched — re-locking is a
+            # no-op, and scheduling it would make the journal's baseline look like
+            # something `apply` wrote when it did not.
+            state = parse_password_status(
+                self.runner.capture("passwd", "--status", cfg.agent_user), cfg.agent_user
+            )
+            if state in LOCKABLE_PASSWORD_STATES:
                 updates.append({"name": cfg.agent_user, "password_lock": True})
         return updates
 
@@ -2396,7 +2445,21 @@ class Checker:
         if agent_in and dev_in:
             report.ok(f"both identities are in {cfg.agent_group}")
         elif agent_in:
-            report.note(f"{cfg.dev_name} is not in {cfg.agent_group} yet (group membership applies on next login)")
+            # A FAIL, not a note. The documented invariant is that the collaboration
+            # group holds the developer AND the agent; when the developer is missing,
+            # the agent is in a group nobody else belongs to, so the worktree grants
+            # reach no collaborator at all — the seam does not exist.
+            #
+            # This is read from NSS (`groups_of`), not from the running session, so
+            # it is a fact about the host rather than a stale login: a developer who
+            # really was added shows up here immediately. The earlier NOTE claimed
+            # otherwise ("group membership applies on next login") and `_verdict`
+            # ignored NOTE, so `check` could print "every invariant holds" and exit 0
+            # for a host whose seam was half-formed.
+            report.fail(
+                f"{cfg.agent_group} does not hold {cfg.dev_name} — the collaboration seam "
+                f"needs both identities; run '{SELF_NAME} apply' to add them"
+            )
         else:
             report.fail(f"{cfg.agent_group} does not hold {cfg.agent_user}")
         # Only the documented two: a third member holds the same recursive write
@@ -2407,7 +2470,7 @@ class Checker:
                 f"{cfg.agent_group} also holds {', '.join(foreign)} — "
                 f"it is documented as {cfg.dev_name} and {cfg.agent_user} only"
             )
-        else:
+        elif agent_in or dev_in:
             report.ok(f"{cfg.agent_group} holds only {cfg.dev_name} and {cfg.agent_user}")
 
     def _sudo_rules(self) -> None:
@@ -2966,9 +3029,27 @@ class Rollback:
                 updates.append({"name": agent, "primary_group": returned_primary})
             # And the password state: `apply` locked a usable password, which is right
             # for the boundary and wrong to keep on an account it is leaving.
-            if state.passwd == "P" and self._password_state() == "L":
-                updates.append({"name": agent, "password_lock": False})
-                print(f"unlocking {agent}'s password (it was usable before apply)")
+            #
+            # The baseline decides, not the current state alone. `P` and `NP` were
+            # both lockable, so both are restored — and an account recorded as `L` is
+            # NEVER unlocked, no matter what `apply` found, because a lock that
+            # predates this tool is its owner's, not ours to remove. That is the
+            # difference the old `state.passwd == "P"` comparison lost.
+            #
+            # NP cannot be restored with `password_lock: false` — measured on Fedora
+            # 43: `usermod` refuses ("unlocking the user's password would result in a
+            # passwordless account") because a passwordless `L` has no hash to bring
+            # back. It is reproduced with an empty password instead, which is the
+            # state `passwd -d` leaves behind.
+            if state.passwd in LOCKABLE_PASSWORD_STATES and self._password_state() == "L":
+                if state.passwd == "NP":
+                    updates.append({"name": agent, "password_unlock_to_empty": True})
+                    print(f"removing the lock from {agent}'s password (it had NO password before apply)")
+                    eprint(f"note: {agent} is back to having no password — it was passwordless before apply,")
+                    eprint(f"      which a PAM stack with `nullok` treats as a login")
+                else:
+                    updates.append({"name": agent, "password_lock": False})
+                    print(f"unlocking {agent}'s password (it was usable before apply)")
 
         if not state.owns("group"):
             eprint(f"kept the {group} group: this script adopted it rather than created it")
@@ -3001,8 +3082,15 @@ class Rollback:
         self.ctx.ansible.run(variables, check=cfg.dry_run)
 
     def _password_state(self) -> str:
-        parts = self.runner.capture("passwd", "--status", self.cfg.agent_user).out.split()
-        return parts[1] if len(parts) > 1 else ""
+        """The CURRENT state, read the same fail-closed way `apply` reads it.
+
+        A rollback that could not read the state would otherwise compare an empty
+        string, decide not to unlock, and leave an account locked with no
+        explanation — the failure mode this returns a refusal for instead.
+        """
+        return parse_password_status(
+            self.runner.capture("passwd", "--status", self.cfg.agent_user), self.cfg.agent_user
+        )
 
 
 # ---------------------------------------------------------------------------

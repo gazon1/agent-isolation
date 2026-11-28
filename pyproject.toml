@@ -14,7 +14,17 @@ dependencies = [
   "pydantic>=2.6,<3",
   # The declarative half's runner. It lives in THIS venv so `sudo` re-executes
   # installed code rather than anything on the caller's PATH (issue #5).
-  "ansible-core==2.21.5",
+  #
+  # A RANGE, not a pin, and the reason is measured: ansible-core 2.21.x cannot run
+  # its own entry points on Python 3.15 (`ansible-galaxy --version` and
+  # `ansible-playbook --version` both die with
+  # `AttributeError: module 'dataclasses' has no attribute '_is_type'`, while
+  # `import ansible` still succeeds), and 2.22.0 requires Python >= 3.13. No single
+  # version covers this project's `>=3.12`. The committed lock resolves BOTH and
+  # `uv export` emits them with `python_full_version` markers, so one hashed
+  # requirements file installs 2.22.0 on 3.15 and 2.21.x on 3.12–3.14. The exact
+  # versions still come from `uv.lock`; nothing floats at install time.
+  "ansible-core>=2.21,<3",
 ]
 
 [project.scripts]

@@ -402,6 +402,26 @@ fi
 INSTALL_STARTED=yes
 echo "Installing the tool into $LIB ..."
 install -d -m 0755 -o root -g root "$LIB"
+# The interpreter is named, and its version is CHECKED before anything is
+# installed. `requires-python` only covers the resolution; a version too new for
+# the pinned Ansible installs cleanly and then fails at the first entry point with
+# `AttributeError: module 'dataclasses' has no attribute '_is_type'` — measured on
+# Python 3.15 with ansible-core 2.21.x, where `import ansible` still succeeds. The
+# lock carries a per-Python fork (2.22.0 for >= 3.13, 2.21.x below), so a version
+# outside the supported range is refused here instead of failing later.
+PYV=$(/usr/bin/python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+# Match the exact "major.minor" this variable holds — `3.12.*` would require a
+# THIRD component and never match `3.12`, which is how this guard first rejected
+# a supported interpreter.
+case "$PYV" in
+    3.12|3.13|3.14|3.15) : ;;
+    *)
+        echo "install.sh: /usr/bin/python3 is $PYV, which this release does not support" >&2
+        echo "            supported: 3.12 to 3.15 (see requires-python and the ansible-core fork in uv.lock)" >&2
+        exit 1
+        ;;
+esac
+echo "  interpreter $PYV"
 "$UV" venv --clear --python /usr/bin/python3 "$LIB/agent-isolation" >/dev/null
 "$UV" pip install \
     --python "$LIB/agent-isolation/bin/python" \

@@ -190,6 +190,32 @@
       loop_control:
         label: "{{ item.name }}: {{ item | dict2items | map(attribute='key') | reject('equalto', 'name') | join(',') }}"
 
+    # Restoring an account that had NO password before `apply`.
+    #
+    # `password_lock: false` cannot express this: measured on Fedora 43, `usermod`
+    # refuses with "unlocking the user's password would result in a passwordless
+    # account", because `L` on a passwordless account carries no hash to restore.
+    # The original state is reproduced explicitly instead — an empty password
+    # string, which is what `passwd -d` leaves behind and what `passwd --status`
+    # then reports as NP.
+    #
+    # This is `command` and not `shell`, so no string is re-parsed, and the name is
+    # passed as a separate argv element.
+    - name: Restore an account that had no password before apply
+      ansible.builtin.command:
+        argv:
+          - usermod
+          - --password
+          - ""
+          - "{{ item.name }}"
+      loop: "{{ agent_user_updates }}"
+      when:
+        - (item.password_unlock_to_empty | default(false)) | bool
+        - not ansible_check_mode
+      changed_when: true
+      loop_control:
+        label: "{{ item.name }}: password unset (it had none before apply)"
+
     # -- ACLs --------------------------------------------------------------
     #
     # One entry per declared grant. An ACL cannot express "grant the traverse bit

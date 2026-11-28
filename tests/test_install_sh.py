@@ -398,6 +398,50 @@ class DependencyLockTest(unittest.TestCase):
         self.assertNotIn('--exclude-newer', self.text,
                          'a date cutoff is not the locked resolution')
 
+    def test_the_lock_carries_an_ansible_fork_per_python_version(self):
+        """No single ansible-core covers Python 3.12–3.15, and that is measured.
+
+        2.21.x cannot run `ansible-galaxy`/`ansible-playbook` on 3.15
+        (`AttributeError: module 'dataclasses' has no attribute '_is_type'`, while
+        `import ansible` still succeeds), and 2.22.0 requires Python >= 3.13. The
+        lock must therefore resolve BOTH, selected by a `python_full_version`
+        marker — otherwise `install.sh` pins one version and the other Python
+        version installs a tool whose entry points are dead.
+        """
+        lock = self.lock.read_text(encoding='utf-8')
+        forks = [
+            line for line in lock.splitlines()
+            if 'name = "ansible-core"' in line and 'marker' in line
+        ]
+        self.assertGreaterEqual(
+            len(forks), 2,
+            'uv.lock resolves a single ansible-core; a host on the other side of the '
+            f'3.13 divide would install an unusable one: {forks}',
+        )
+        markers = ' '.join(forks)
+        self.assertIn("python_full_version < '3.13'", markers)
+        self.assertIn("python_full_version >= '3.13'", markers)
+
+    def test_the_installed_interpreter_version_is_checked_up_front(self):
+        """`requires-python` governs resolution only; a too-new interpreter installs
+        cleanly and fails inside Ansible later, which is the failure this prevents."""
+        self.assertIn('which this release does not support', self.text)
+        # The exact "major.minor" the variable holds: `3.12.*` needs a third
+        # component and never matches `3.12` — that is how this guard first
+        # rejected a supported interpreter, measured in the container suite.
+        self.assertIn('3.12|3.13|3.14|3.15)', self.text)
+        # Checked BEFORE the venv is created, so a refused host is untouched.
+        check = self.text.index('which this release does not support')
+        venv = self.text.index('"$UV" venv --clear --python /usr/bin/python3')
+        self.assertLess(check, venv, 'the version is checked before anything is installed')
+
+    def test_the_ansible_constraint_is_a_range_not_a_pin(self):
+        """Reverting to `==` would make the lock single-version again."""
+        pyproject = (REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8')
+        self.assertIn('"ansible-core>=2.21,<3"', pyproject)
+        self.assertNotIn('"ansible-core==', pyproject,
+                         'a pin cannot cover both sides of the Python 3.13 divide')
+
     def test_every_runtime_dependency_is_pinned_in_the_lock(self):
         import re
 
