@@ -718,13 +718,16 @@ class InstallLifecycleHarness:
 
     def _write_shims(self):
         real_stat = shutil.which('stat', path='/usr/bin:/bin') or '/usr/bin/stat'
+        stat_real = self.shim / 'stat.real'
+        shutil.copy2(real_stat, stat_real)
+        stat_real.chmod(0o755)
         (self.shim / 'stat').write_text(
             textwrap.dedent(f"""\
                 #!/bin/sh
                 # In the user namespace, host files appear as overflow uid; report
                 # them as root-owned and non-writable so assert_trusted exercises
                 # its real logic on controlled paths.
-                real={real_stat!s}
+                real={str(stat_real)!s}
                 last=""; for a in "$@"; do last="$a"; done
                 case "$last" in
                     "$FAKE_ROOT"/*|"$FAKE_ROOT")
