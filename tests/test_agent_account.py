@@ -2973,6 +2973,80 @@ class RunTest(Base):
             aa.Launcher(ctx, {}).command(())
         self.assertIn('run needs a command', str(caught.exception))
 
+    def _launcher_raising(self, raising):
+        ctx = self.context()
+
+        def execvp(name, argv):
+            raise raising
+
+        return aa.Launcher(ctx, {}, execvp=execvp)
+
+    def test_a_missing_sudo_is_a_refusal_and_not_a_traceback(self):
+        """`execvp` only returns by raising, so a failed hand-over is an OSError.
+
+        Before this, `run` let it escape: a raw traceback and exit 1, which the CLI
+        documents as "an invariant does not hold" — the wrong answer for a transition
+        that never started. `elevate()` already translated the same exception.
+        """
+        import errno
+
+        launcher = self._launcher_raising(FileNotFoundError(errno.ENOENT, 'No such file or directory', 'sudo'))
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            launcher.run(('id',))
+        message = str(caught.exception)
+        self.assertIn('cannot start the command as', message)
+        self.assertIn(AGENT, message)
+        self.assertIn('sudo', message)
+
+    def test_a_permission_error_is_a_refusal(self):
+        import errno
+
+        launcher = self._launcher_raising(PermissionError(errno.EACCES, 'Permission denied'))
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            launcher.run(('id',))
+        self.assertIn('cannot start the command as', str(caught.exception))
+        self.assertIn('Permission denied', str(caught.exception))
+
+    def test_a_not_executable_hand_over_is_a_refusal(self):
+        import errno
+
+        launcher = self._launcher_raising(OSError(errno.ENOEXEC, 'Exec format error'))
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            launcher.run(('id',))
+        self.assertIn('Exec format error', str(caught.exception))
+
+    def test_the_translation_carries_no_original_traceback(self):
+        """`from None`: the OSError is replaced, not chained — a user-facing refusal
+        should not print a Python traceback above it."""
+        import errno
+
+        launcher = self._launcher_raising(FileNotFoundError(errno.ENOENT, 'No such file or directory', 'sudo'))
+        try:
+            launcher.run(('id',))
+        except aa.AgentAccountError as error:
+            self.assertIsNone(error.__cause__, 'the OSError must not be chained')
+        else:
+            self.fail('no refusal raised')
+
+    def test_a_successful_hand_over_still_execs_the_sudo_command(self):
+        """The behaviour that must not change: `run` hands over the built command."""
+        ctx = self.context()
+        calls = []
+
+        def execvp(name, argv):
+            calls.append((name, argv))
+            raise SystemExit(0)  # what a real successful execvp does, in effect
+
+        launcher = aa.Launcher(ctx, {}, execvp=execvp)
+        with self.assertRaises(SystemExit):
+            launcher.run(('id', '-un'))
+        self.assertEqual(1, len(calls))
+        name, argv = calls[0]
+        self.assertEqual('sudo', name)
+        self.assertEqual(argv, launcher.command(('id', '-un')))
+        # SystemExit is NOT translated: only OSError is the failed-hand-over surface.
+        self.assertIn(f'--user={AGENT}', argv)
+
 
 # ---------------------------------------------------------------------------
 # rollback

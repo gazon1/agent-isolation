@@ -2862,7 +2862,23 @@ class Launcher:
 
     def run(self, argv: Sequence[str]) -> None:
         command = self.command(argv)
-        self.execvp(command[0], command)
+        try:
+            self.execvp(command[0], command)
+        except OSError as error:
+            # Same convention as `elevate()`, and for the same reason: `execvp` only
+            # returns by RAISING, so an OSError here is the whole surface of "the
+            # command never started" — 127 not on PATH, 126 not executable, EPERM,
+            # ENOEXEC. Without this it was an unhandled traceback and exit 1, which
+            # the CLI documents as "an invariant does not hold": the wrong answer for
+            # a transition that never began.
+            #
+            # A `sudo` that RUNS and then fails is NOT this case: execvp succeeded, so
+            # this process IS sudo, and sudo's own message and exit code are the
+            # honest answer. Only the failure to hand over is translated here.
+            raise AgentAccountError(
+                f"cannot start the command as {self.ctx.cfg.agent_user} "
+                f"({error.strerror or error}): {' '.join(command)}"
+            ) from None
 
 
 # ---------------------------------------------------------------------------
