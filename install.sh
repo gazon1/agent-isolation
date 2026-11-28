@@ -195,37 +195,54 @@ chown "$BUILD_USER:$BUILD_GROUP" "$WORK"
 chmod 0755 "$WORK"
 STAGE=""
 BACKUP=""
+BACKUP_READY=no
+INSTALL_STARTED=no
 COMMITTED=no
 CLEANUP_STATUS=0
+CLEANUP_DONE=no
 
 cleanup() {
     CLEANUP_STATUS=$?
     set +e
-    if [ "$COMMITTED" = yes ]; then
-        rm -rf -- "$STAGE" "$WORK"
+    if [ "$CLEANUP_DONE" = yes ]; then
         exit "$CLEANUP_STATUS"
     fi
-    if [ -n "$BACKUP" ] && [ -d "$BACKUP" ]; then
+    CLEANUP_DONE=yes
+    trap '' INT TERM
+    if [ "$COMMITTED" = yes ]; then
+        [ -n "$STAGE" ] && rm -rf -- "$STAGE"
+        [ -n "$WORK" ] && rm -rf -- "$WORK"
+        exit "$CLEANUP_STATUS"
+    fi
+    if [ "$INSTALL_STARTED" = yes ] && [ "$BACKUP_READY" = yes ] && [ -n "$BACKUP" ] && [ -d "$BACKUP" ]; then
         rm -rf -- "$LIB"
         if mv -- "$BACKUP" "$LIB"; then
             echo "install.sh: rolled back to the previous installation" >&2
             BACKUP=""
-            rm -rf -- "$STAGE" "$WORK"
+            [ -n "$STAGE" ] && rm -rf -- "$STAGE"
+            [ -n "$WORK" ] && rm -rf -- "$WORK"
         else
             echo "install.sh: COULD NOT ROLL BACK; the previous tree is at $BACKUP" >&2
             echo "install.sh: staging directory preserved at $STAGE" >&2
-            rm -rf -- "$WORK"
+            [ -n "$WORK" ] && rm -rf -- "$WORK"
         fi
-    else
-        # First install or no backup: remove the partial install rather than
+    elif [ "$INSTALL_STARTED" = yes ]; then
+        # First install or no usable backup: remove the partial install rather than
         # leaving a half-installed root-owned tree behind.
         rm -rf -- "$LIB"
-        rm -rf -- "$STAGE" "$WORK"
+        [ -n "$STAGE" ] && rm -rf -- "$STAGE"
+        [ -n "$WORK" ] && rm -rf -- "$WORK"
+    else
+        # Install never started mutating $LIB; leave any existing install alone.
+        [ -n "$STAGE" ] && rm -rf -- "$STAGE"
+        [ -n "$WORK" ] && rm -rf -- "$WORK"
     fi
     exit "$CLEANUP_STATUS"
 }
 # shellcheck disable=SC2064
-trap 'cleanup' EXIT INT TERM
+trap 'cleanup' EXIT
+trap 'CLEANUP_STATUS=130; exit 130' INT
+trap 'CLEANUP_STATUS=143; exit 143' TERM
 
 echo "Building the wheel as $BUILD_USER (no root code execution) ..."
 # `runuser` first: it does not prompt (we are root) and it preserves the
@@ -292,13 +309,20 @@ STAGE=$(mktemp -d)
 chmod 0755 "$STAGE"
 
 # Keep the previous tree aside. `$LIB` may not exist on a first install.
+if [ -L "$LIB" ] || { [ -e "$LIB" ] && [ ! -d "$LIB" ]; }; then
+    echo "install.sh: $LIB exists but is not a directory; refusing to replace it" >&2
+    exit 1
+fi
 if [ -d "$LIB" ]; then
     BACKUP="$STAGE/previous"
-    cp -a "$LIB" "$BACKUP"
+    cp -a -- "$LIB" "$BACKUP"
+    BACKUP_READY=yes
 fi
 
 # `--no-build`: the ONLY thing root accepts is a prebuilt wheel and cached wheels
-# of the dependencies. `agent-isolation` itself is never built here.
+# of the dependencies. `agent-isolation` itself is never built here. Past this
+# point the install mutates $LIB and cleanup may restore or remove it.
+INSTALL_STARTED=yes
 echo "Installing the tool into $LIB ..."
 UV_TOOL_DIR="$LIB" UV_TOOL_BIN_DIR="$LIB/bin-dir" "$UV" tool install \
     --python /usr/bin/python3 \

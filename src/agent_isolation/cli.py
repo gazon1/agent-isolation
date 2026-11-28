@@ -305,6 +305,31 @@ class Result:
     err: str = ""
 
 
+TRUSTED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _safe_subprocess_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """A minimal environment for privileged or security-sensitive subprocesses.
+
+    The caller's environment is untrusted: PATH/PYTHON*/UV*/GIT*/ANSIBLE* can
+    redirect binary or module resolution. We keep a small allowlist and set a
+    fixed PATH and locale.
+    """
+    base = dict(os.environ if environ is None else environ)
+    allowed = {"HOME", "LANG", "LC_CTYPE", "LC_MESSAGES", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TZ", "USER"}
+    env: dict[str, str] = {}
+    for key, value in base.items():
+        if key in allowed and not key.startswith(("ANSIBLE_", "GIT_", "PYTHON", "UV_")):
+            env[key] = value
+    env["PATH"] = TRUSTED_PATH
+    lang = env.get("LANG", "")
+    if not lang.upper().endswith(("UTF-8", "UTF8")):
+        lang = "C.UTF-8"
+    env["LANG"] = lang
+    env["LC_ALL"] = "C"
+    return env
+
+
 class Runner:
     """The only way this script changes the host, and the owner of --dry-run.
 
@@ -316,9 +341,7 @@ class Runner:
 
     def __init__(self, dry_run: bool = False, environ: Mapping[str, str] | None = None):
         self.dry_run = dry_run
-        base = dict(os.environ if environ is None else environ)
-        self.env = {k: v for k, v in base.items() if not k.startswith("GIT_")}
-        self.env["LC_ALL"] = "C"
+        self.env = _safe_subprocess_env(environ)
 
     # the single seam a test replaces
     def _exec(self, argv: Sequence[str], input_text: str | None, capture: bool) -> Result:
@@ -497,28 +520,10 @@ class Ansible:
     def __init__(self, cfg: Config, runner: Runner):
         self.cfg = cfg
         self.runner = runner
-        #: Generated configs and temp dirs, removed once the playbook has returned.
+        #: Generated configs, removed once the playbook has returned.
         self._configs: list[Path] = []
-
-    #: Everything Ansible would let the CALLER redirect through the environment.
-    #: `ANSIBLE_CONFIG`, the plugin and module paths, and the collection path are
-    #: the ones that load code; the rest are dropped for tidiness.
-    _CALLER_ANSIBLE_VARS = (
-        "ANSIBLE_CONFIG",
-        "ANSIBLE_HOME",
-        "ANSIBLE_COLLECTIONS_PATH",
-        "ANSIBLE_COLLECTIONS_PATHS",
-        "ANSIBLE_LIBRARY",
-        "ANSIBLE_ACTION_PLUGINS",
-        "ANSIBLE_CALLBACK_PLUGINS",
-        "ANSIBLE_CONNECTION_PLUGINS",
-        "ANSIBLE_FILTER_PLUGINS",
-        "ANSIBLE_LOOKUP_PLUGINS",
-        "ANSIBLE_INVENTORY_PLUGINS",
-        "ANSIBLE_MODULE_UTILS",
-        "ANSIBLE_BECOME_EXE",
-        "ANSIBLE_PYTHON_INTERPRETER",
-    )
+        #: Generated temp dirs, removed once the playbook has returned.
+        self._tempdirs: list[Path] = []
 
     def _environment(self) -> dict[str, str]:
         """The environment the privileged playbook runs in: built, not inherited.
@@ -529,11 +534,11 @@ class Ansible:
         config search includes `ANSIBLE_CONFIG`, `./ansible.cfg`, `~/.ansible.cfg`
         and `/etc/ansible/ansible.cfg` — two of those can be the caller's.
 
-        So: a generated root-only config, named explicitly, the caller's env
-        variables removed, and the plugin/collection paths that the installation
-        owns set as the only ones.
+        The caller's environment is already sanitized by Runner; we still drop any
+        ANSIBLE_* keys, then set only the variables this installation owns. Temp
+        dirs are created by us with safe permissions and removed in run().
         """
-        env = {k: v for k, v in self.runner.env.items() if k not in self._CALLER_ANSIBLE_VARS}
+        env = {k: v for k, v in self.runner.env.items() if not k.startswith("ANSIBLE_")}
         # NOT LC_ALL=C, which every other subprocess here wants: Ansible refuses to
         # start without a UTF-8 locale ("Detected None"). The playbook parses no
         # localized tool output, so the one setting cannot make it misread anything.
@@ -543,10 +548,12 @@ class Ansible:
         env["ANSIBLE_CONFIG"] = str(self._config_file())
         if self.cfg.ansible_collections_path:
             env["ANSIBLE_COLLECTIONS_PATH"] = self.cfg.ansible_collections_path
-        # Ansible writes its temp files under the target's HOME; root's is not the
-        # caller's, and a read-only or absent one fails the run.
-        env.setdefault("ANSIBLE_LOCAL_TEMP", tempfile.mkdtemp(prefix="agent-account-ansible-"))
-        env.setdefault("ANSIBLE_REMOTE_TEMP", env["ANSIBLE_LOCAL_TEMP"])
+        # Ansible writes temp files; caller-supplied temp dirs are untrusted.
+        tempdir = Path(tempfile.mkdtemp(prefix="agent-account-ansible-"))
+        os.chmod(tempdir, 0o700)
+        self._tempdirs.append(tempdir)
+        env["ANSIBLE_LOCAL_TEMP"] = str(tempdir)
+        env["ANSIBLE_REMOTE_TEMP"] = str(tempdir)
         return env
 
     def _config_file(self) -> Path:
@@ -590,18 +597,35 @@ class Ansible:
             vars_path = handle.name
         os.chmod(vars_path, 0o600)
         argv += ["-e", f"@{vars_path}"]
+        run_error: Exception | None = None
         try:
             # `cwd` is explicit: Ansible's config search includes `./ansible.cfg`,
             # so inheriting the caller's directory is itself the vulnerability.
             result = subprocess.run(argv, env=env, cwd=env["ANSIBLE_LOCAL_TEMP"], check=False)
+        except Exception as error:
+            run_error = error
+            result = None
         finally:
+            cleanup_errors: list[str] = []
             with contextlib.suppress(OSError):
                 os.unlink(vars_path)
             for path in self._configs:
-                with contextlib.suppress(OSError):
+                try:
                     os.unlink(path)
+                except OSError as error:
+                    cleanup_errors.append(f"{path}: {error}")
             self._configs.clear()
-        if result.returncode != 0:
+            for path in self._tempdirs:
+                try:
+                    shutil.rmtree(path)
+                except OSError as error:
+                    cleanup_errors.append(f"{path}: {error}")
+            self._tempdirs.clear()
+        if run_error is not None:
+            raise run_error
+        if cleanup_errors:
+            eprint(f"{SELF_NAME}: warning: could not remove temporary files: {'; '.join(cleanup_errors)}")
+        if result is not None and result.returncode != 0:
             raise AgentAccountError(f"the playbook failed ({result.returncode}): {' '.join(shlex.quote(a) for a in argv)}")
 
 

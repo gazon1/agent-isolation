@@ -35,9 +35,11 @@ import importlib.util
 import io
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -2036,6 +2038,42 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(f'{DEV} ALL=({AGENT}) NOPASSWD: /usr/bin/env', cfg.sudoers_rule)
 
 
+class RunnerEnvironmentTest(unittest.TestCase):
+    """Privileged subprocesses must not inherit caller-controlled module/path knobs."""
+
+    def test_hostile_env_vars_are_removed_and_path_is_fixed(self):
+        runner = aa.Runner(environ={
+            'PATH': '/tmp/evil:/usr/bin',
+            'PYTHONPATH': '/tmp/evil-modules',
+            'PYTHONHOME': '/tmp/evil-python',
+            'VIRTUAL_ENV': '/tmp/evil-venv',
+            'UV_PYTHON': '/tmp/evil-uv',
+            'GIT_DIR': '/tmp/evil-git',
+            'ANSIBLE_LIBRARY': '/tmp/evil-ansible',
+            'HOME': '/home/dev',
+        })
+        self.assertEqual(aa.TRUSTED_PATH, runner.env['PATH'])
+        for key in ('PYTHONPATH', 'PYTHONHOME', 'VIRTUAL_ENV', 'UV_PYTHON', 'GIT_DIR', 'ANSIBLE_LIBRARY'):
+            self.assertNotIn(key, runner.env, key)
+        self.assertEqual('C', runner.env['LC_ALL'])
+        self.assertEqual('/home/dev', runner.env.get('HOME'))
+
+    def test_pythonpath_cannot_inject_module_into_runner_subprocess(self):
+        with tempfile.TemporaryDirectory(prefix='aa-pyinj-') as td:
+            root = pathlib.Path(td)
+            (root / 'evilmod.py').write_text('print("PWNED")\n', encoding='utf-8')
+            marker = root / 'marker'
+            # A subprocess that tries to import the injected module; it must fail.
+            runner = aa.Runner(environ={
+                'PYTHONPATH': str(root),
+                'PATH': '/tmp/evil:' + str(pathlib.Path('/usr/bin')),
+            })
+            result = runner.capture(sys.executable, '-c',
+                                    'import evilmod, pathlib; pathlib.Path(%r).write_text("pwned")' % str(marker))
+            self.assertNotEqual(0, result.rc)
+            self.assertFalse(marker.exists(), 'caller PYTHONPATH was inherited by subprocess')
+
+
 class AnsibleIsolationTest(unittest.TestCase):
     """The privileged playbook must load no config, plugin or module from the caller.
 
@@ -2054,6 +2092,7 @@ class AnsibleIsolationTest(unittest.TestCase):
         runner = aa.Runner(dry_run=True, environ=environ or {})
         instance = aa.Ansible(cfg, runner)
         self.addCleanup(instance._configs.clear)
+        self.addCleanup(lambda: [shutil.rmtree(p, ignore_errors=True) for p in list(instance._tempdirs)])
         return instance
 
     def test_the_config_is_named_explicitly_and_is_not_the_caller_s(self):
@@ -2071,12 +2110,16 @@ class AnsibleIsolationTest(unittest.TestCase):
             'ANSIBLE_ACTION_PLUGINS': '/tmp/evil/actions',
             'ANSIBLE_COLLECTIONS_PATH': '/tmp/evil/collections',
             'ANSIBLE_CALLBACK_PLUGINS': '/tmp/evil/callbacks',
+            'ANSIBLE_LOCAL_TEMP': '/tmp/evil-tmp',
+            'ANSIBLE_REMOTE_TEMP': '/tmp/evil-tmp',
         }
         instance = self._ansible(environ=hostile)
         env = instance._environment()
         for name in hostile:
             self.assertNotEqual(hostile[name], env.get(name), f'{name} reached the playbook')
         self.assertNotIn('/tmp/evil', env.get('ANSIBLE_CONFIG', ''))
+        self.assertNotIn('/tmp/evil-tmp', env.get('ANSIBLE_LOCAL_TEMP', ''))
+        self.assertNotIn('/tmp/evil-tmp', env.get('ANSIBLE_REMOTE_TEMP', ''))
 
     def test_the_collection_path_is_the_installation_s(self):
         instance = self._ansible(collections='/opt/agent-isolation/collections')
@@ -2094,8 +2137,26 @@ class AnsibleIsolationTest(unittest.TestCase):
         env = instance._environment()
         config = pathlib.Path(env['ANSIBLE_CONFIG'])
         self.assertTrue(config.exists())
-        # The cleanup runs in `run`; emulate its effect and assert the list is used.
         self.assertIn(config, instance._configs)
+
+    def test_temp_dirs_are_created_safely_and_tracked(self):
+        instance = self._ansible(environ={'ANSIBLE_LOCAL_TEMP': '/tmp/evil', 'ANSIBLE_REMOTE_TEMP': '/tmp/evil'})
+        env = instance._environment()
+        temp = pathlib.Path(env['ANSIBLE_LOCAL_TEMP'])
+        self.assertTrue(temp.is_dir())
+        self.assertEqual(0o700, temp.stat().st_mode & 0o777)
+        self.assertEqual(env['ANSIBLE_LOCAL_TEMP'], env['ANSIBLE_REMOTE_TEMP'])
+        self.assertIn(temp, instance._tempdirs)
+
+    def test_run_cleans_temp_dirs_and_config(self):
+        instance = self._ansible()
+        env = instance._environment()
+        config = pathlib.Path(env['ANSIBLE_CONFIG'])
+        temp = pathlib.Path(env['ANSIBLE_LOCAL_TEMP'])
+        with mock.patch('subprocess.run', return_value=subprocess.CompletedProcess(args=[], returncode=0)):
+            instance.run({'x': 1})
+        self.assertFalse(config.exists())
+        self.assertFalse(temp.exists())
 
 
 class AnsibleResolutionTest(unittest.TestCase):
