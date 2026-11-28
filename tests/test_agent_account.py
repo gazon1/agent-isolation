@@ -1697,14 +1697,162 @@ class CheckTest(Base):
         _, out, _ = self.quiet(checker._acls)
         self.assertIn('the ACL mask limits it to', out)
 
-    def test_an_unverifiable_sudo_answer_is_a_note_not_a_pass(self):
+    def test_an_unverifiable_sudo_answer_is_UNVERIFIED_not_a_pass(self):
+        """`check` without root cannot read another user's rules.
+
+        It used to report NOTE, and `run()` returned 0 on it — so an unprivileged
+        `check` on a host where `agent` had acquired `ALL=(ALL) NOPASSWD: ALL`
+        printed "every invariant holds" and exited 0. Automation reads that as a
+        verified boundary, which is the opposite of what was established.
+        """
         ctx = self.context()
         ctx.runner.responses = ((('sudo',), aa.Result(1, '', 'a password is required')),)
         checker = self._checker(ctx)
         checker.report = aa.Report()
         _, out, _ = self.quiet(checker._sudo_rules)
-        self.assertIn('NOTE', out)
+        self.assertIn('UNVERIFIED', out)
         self.assertNotIn('PASS', out)
+        self.assertNotIn('FAIL', out, 'unverifiable is not the same as broken')
+        self.assertEqual(1, len(checker.report.unverified_checks))
+
+    def test_the_verdict_is_3_when_sudo_is_the_only_unverifiable_check(self):
+        """The acceptance criterion, end to end through `Checker.run()`.
+
+        Every other invariant is made to pass, and the sudo listing is the one
+        answer that cannot be obtained. That must not be an unconditional success.
+        """
+        ctx = self._provisioned_context(roots=(self.wt,))
+        # Everything readable; the sudo listing is the single unreadable answer.
+        # Appended, not assigned: the ACL answers are installed by the fixture.
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'), aa.Result(1, '', 'a password is required')),
+        ) + tuple(ctx.runner.responses)
+        checker = self._checker(ctx)
+        # The probe half needs a working transition; the run has to reach the summary,
+        # which is where the wrong exit code was produced.
+        self._stub_agent_probes(checker)
+        rc, out = self._run_full(checker)
+        self.assertEqual(3, rc, out)
+        self.assertNotIn('every invariant holds', out)
+        self.assertIn('could NOT be verified', out)
+        self.assertIn('not certified', out)
+        self.assertIn('re-run as root', out)
+
+    def test_the_verdict_is_0_when_sudo_was_verifiable(self):
+        """The other half: a host whose rules COULD be read still certifies cleanly,
+        so 3 is not simply "always" for an unprivileged run."""
+        ctx = self._provisioned_context(roots=(self.wt,))
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'),
+             aa.Result(0, 'User agent is not allowed to run sudo on host.\n', '')),
+        ) + tuple(ctx.runner.responses)
+        checker = self._checker(ctx)
+        self._stub_agent_probes(checker)
+        rc, out = self._run_full(checker)
+        self.assertEqual(0, rc, out)
+        self.assertIn('every invariant holds', out)
+
+    def test_a_failure_outranks_an_unverified_boundary(self):
+        """1 beats 3: when something is known broken, the broken thing is the answer."""
+        ctx = self.context(roots=(self.wt,))
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'), aa.Result(1, '', 'a password is required')),
+        )
+        checker = self._checker(ctx)
+        checker.transition_ok = True
+        checker.agent_can = lambda path, bits: True
+        checker.report = aa.Report()
+        checker.report.unverified('a boundary')
+        checker.report.fail('an invariant')
+        rc, out = self._run_verdict(checker, preloaded=True)
+        self.assertEqual(1, rc, out)
+        self.assertIn('DO NOT hold', out)
+
+    def test_the_summary_counts_what_it_actually_examined(self):
+        """The summary has to distinguish verified from unverified, not total them."""
+        checker = self._checker(self.context())
+        checker.report = aa.Report()
+        checker.report.ok('one')
+        checker.report.ok('two')
+        checker.report.unverified('three')
+        rc, out = self._run_verdict(checker, preloaded=True)
+        self.assertEqual(3, rc, out)
+        self.assertIn('2 passed', out, 'the PASS count is reported separately')
+        self.assertIn('1 check(s) could NOT be verified', out)
+
+    def _provisioned_context(self, **kwargs):
+        """A context whose host answers `check` the way a provisioned one does.
+
+        The ACL half asks REAL `getfacl` questions, so a host that was never
+        `apply`-ed fails them for reasons unrelated to the verdict under test.
+        `RecordingAnsible` writes no ACLs, so the answers are supplied — and they
+        depend on the PATH, because one answer cannot both be the traverse-only
+        grant on `$HOME`, the read grant on a toolchain directory, and the absence
+        of any grant on `.git/config`. Those three are what `check` asserts.
+        """
+        ctx = self.context(**kwargs)
+        base = ctx.runner._exec
+        home = str(self.home)
+
+        def body_for(path: str) -> str:
+            if path.endswith(('/config', '/hooks')):
+                # Denied outright: no entry for the seam at all.
+                return 'user::rw-\ngroup::r--\nmask::r--\nother::r--\n'
+            if path == home:
+                # The home is TRAVERSE only, never a read. A read here is the
+                # boundary failure the `home_read_grant` predicate exists to catch.
+                return (
+                    f'user::rwx\nuser:{AGENT}:--x\ngroup::---\nmask::--x\nother::---\n'
+                )
+            if path in (str(self.home / 'Android/Sdk'),
+                        str(self.home / '.local/share/mise'),
+                        str(self.home / '.local/bin')):
+                return (
+                    f'user::rwx\nuser:{AGENT}:r-x\ndefault:user:{AGENT}:r-x\n'
+                    'group::r-x\nmask::r-x\nother::---\n'
+                )
+            # Everything else in the tree: the recursive worktree/store grant.
+            return (
+                f'user::rwx\nuser:{AGENT}:--x\n'
+                f'group:{SEAM}:rwx\ndefault:group:{SEAM}:rwx\n'
+                'group::r-x\nmask::rwx\nother::---\n'
+            )
+
+        def exec_(argv, input_text, capture):
+            if argv and argv[0] == 'getfacl':
+                return aa.Result(0, body_for(str(argv[-1])), '')
+            return base(argv, input_text, capture)
+
+        ctx.runner._exec = exec_
+        return ctx
+
+    def _stub_agent_probes(self, checker):
+        """Only the TRANSITION works; every negative probe says "no access".
+
+        Without this the run picks up the test host's own docker socket and
+        /dev/kvm and reports real FAILs, which would make the exit code 1 for
+        reasons that have nothing to do with the unverified sudo listing.
+        """
+        def as_agent(*argv):
+            if tuple(argv) == ('id', '-u'):
+                return aa.Result(0, f'{checker.ctx.agent_uid()}\n', '')
+            return aa.Result(1, '', '')
+        checker._as_agent = as_agent
+        checker.agent_can = lambda path, bits: True
+
+    def _run_full(self, checker):
+        """The whole `check`, so the case exercises the real summary and exit code."""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = checker.run()
+        return rc, out.getvalue() + err.getvalue()
+
+    def _run_verdict(self, checker, *, preloaded: bool = False):
+        """Run only the verdict, so the case is about the exit code and nothing else."""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = checker._verdict()
+        return rc, out.getvalue() + err.getvalue()
 
     def test_a_sudo_rule_for_the_agent_is_a_failure(self):
         ctx = self.context()

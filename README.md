@@ -200,7 +200,14 @@ agent-account [OPTIONS] rollback [ROOTS...]
 | `--dry-run` | print the plan, change nothing | off |
 | `--allow-in-home` | accept a root inside `$HOME` | off |
 
-Exit codes: `0` every invariant holds, `1` at least one does not, `2` usage or error.
+Exit codes: `0` every invariant holds **and** every security boundary was verified,
+`1` at least one invariant does not hold, `2` usage or error, `3` nothing failed but at
+least one security boundary could not be examined — so the host is **not** certified.
+
+`check` needs no root, but reading another user's sudo rules does. Run unprivileged, it
+reports that as `UNVERIFIED` and exits `3` rather than certifying a boundary it could not
+look at; `sudo agent-account check` verifies it. Automation should treat `0` as the only
+success and `3` as "ask again as root", never as "the boundary holds".
 
 There is deliberately **no** option to point the tool at another Ansible, another
 collection directory, or a `PYTHONPATH`. An Ansible collection is Python code, and the

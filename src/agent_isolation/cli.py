@@ -65,7 +65,10 @@ list the home. The secrets stay shut (the home is 0700, `~/.ssh` and `.gnupg` ar
 why the authorized worktree root is recommended outside the home
 (`--allow-in-home` opts in, loudly). It goes away when the home needs no shared SDK.
 
-Exit codes: 0 every invariant holds, 1 at least one does not, 2 usage/error.
+Exit codes: 0 every invariant holds and every security boundary was verified;
+1 at least one invariant does not hold; 2 usage/error; 3 nothing failed but at
+least one security boundary could not be examined (an unprivileged `check` cannot
+read another user's sudo rules), so the host is NOT certified.
 
 HOW THE WORK IS SPLIT
 
@@ -2252,6 +2255,19 @@ def _require_no_nested_git_metadata(root: Path) -> None:
 
 
 class Report:
+    """Three outcomes, not two. The THIRD one is why this is not a bool.
+
+    A check that could not answer is not a check that passed. Collapsing "unknown"
+    into "PASS" certifies an unverified security boundary, and collapsing it into
+    "FAIL" reports a correctly provisioned host as broken. They are different facts
+    and they get different exit codes.
+
+    Only the SECURITY-BOUNDARY verdicts use UNVERIFIED. A note about the developer's
+    group membership, or about behaviour probes that could not run because the
+    transition is broken, describes the RUN rather than an unchecked boundary — and
+    in the transition case a FAIL already reports the real problem.
+    """
+
     def __init__(self) -> None:
         self.verdicts: list[tuple[str, str]] = []
 
@@ -2268,6 +2284,9 @@ class Report:
     def note(self, message: str) -> None:
         self._add("NOTE", message)
 
+    def unverified(self, message: str) -> None:
+        self._add("UNVERIFIED", message)
+
     @property
     def failures(self) -> list[str]:
         return [m for level, m in self.verdicts if level == "FAIL"]
@@ -2275,6 +2294,13 @@ class Report:
     @property
     def failed(self) -> bool:
         return bool(self.failures)
+
+    @property
+    def unverified_checks(self) -> list[str]:
+        return [m for level, m in self.verdicts if level == "UNVERIFIED"]
+
+    def count(self, level: str) -> int:
+        return sum(1 for name, _ in self.verdicts if name == level)
 
 
 class Checker:
@@ -2300,9 +2326,35 @@ class Checker:
         # And now ask the KERNEL, not `getfacl`: access(2) also weighs SELinux, the
         # modes of every parent directory and the mount options.
         self._behaviour_probes()
-        if self.report.failed:
+        return self._verdict()
+
+    def _verdict(self) -> int:
+        """The exit code, and a summary that says which kind of answer this is.
+
+        Checked before "every invariant holds", because a run with an unexamined
+        boundary must not print that sentence. 3 is deliberately not 1: a caller
+        needs to tell "the boundary is broken" from "the boundary was not examined",
+        and automation that treats 0 as "verified" must not see it here.
+        """
+        report = self.report
+        passes = report.count("PASS")
+        unverified = len(report.unverified_checks)
+        if report.failed:
+            print(
+                f"=== {len(report.failures)} invariant(s) DO NOT hold "
+                f"({passes} passed, {unverified} unverified) ==="
+            )
             return 1
-        print("=== every invariant holds ===")
+        if unverified:
+            print(
+                f"=== {unverified} check(s) could NOT be verified "
+                f"({passes} passed) — the boundary is not certified ==="
+            )
+            for message in report.unverified_checks:
+                print(f"    unverified: {message}")
+            print(f"=== re-run as root to verify them: sudo -n {SELF_NAME} check ... ===")
+            return 3
+        print(f"=== every invariant holds ({passes} checks) ===")
         return 0
 
     # -- identities ---------------------------------------------------------
@@ -2362,9 +2414,15 @@ class Checker:
         agent = self.cfg.agent_user
         result = self.runner.capture("sudo", "--non-interactive", "--list", f"--other-user={agent}")
         if result.rc != 0:
-            # Reading another user's rules needs root: a check that could not run is
-            # not a clean bill of health.
-            self.report.note(f"{agent}'s sudo rights unverified (needs root): sudo -n -l -U {agent}")
+            # Reading another user's rules needs root. This is a SECURITY boundary
+            # that was not examined, so it is UNVERIFIED — not a NOTE and never a
+            # PASS. Measured consequence of the old NOTE: an unprivileged `check` on
+            # a host where `agent` had acquired `ALL=(ALL) NOPASSWD: ALL` printed
+            # "every invariant holds" and exited 0, so automation read a successful
+            # exit code as a verified boundary.
+            self.report.unverified(
+                f"{agent}'s sudo rights UNVERIFIED (needs root): sudo -n -l -U {agent}"
+            )
             return
         rules = parse_sudo_rules(result.out)
         if rules:
@@ -3155,7 +3213,7 @@ dry_run_option = click.option("--dry-run", is_flag=True, help="Print the plan; c
 @click.group(
     cls=AgentGroup,
     context_settings={"help_option_names": ["-h", "--help"]},
-    epilog="Exit codes: 0 every invariant holds, 1 at least one does not, 2 usage or error.",
+    epilog="Exit codes: 0 every invariant holds and every boundary was verified, 1 at least one does not hold, 2 usage or error, 3 a boundary could not be verified.",
 )
 @click.pass_context
 def cli(ctx: click.Context) -> None:
@@ -3195,7 +3253,11 @@ def apply(deps: Deps, dry_run: bool, allow_in_home: bool, roots: tuple[Path, ...
 @click.pass_obj
 def check(deps: Deps, roots: tuple[Path, ...],
          **identity: object) -> None:
-    """Print a verdict on every invariant. Needs no root."""
+    """Print a verdict on every invariant. Needs no root.
+
+    Exits 3, not 0, when a security boundary could not be examined — reading
+    another user's sudo rules needs root. Run through sudo to get a 0.
+    """
     ctx = make_context(deps, roots=roots, **identity)
     click.get_current_context().exit(Checker(ctx).run())
 
