@@ -2217,15 +2217,61 @@ class SharedGitStoreTest(Base):
 
     def test_check_asks_for_what_apply_writes_on_the_common_dir(self):
         """`apply` writes `.git` as `r-x`; `check` asked for `rwx` and failed every
-        correctly provisioned host — measured on the first live apply."""
+        correctly provisioned host — measured on the first live apply.
+
+        The DEFAULT entry is the second half of the same rule, and it is conditional:
+        a plain worktree keeps its index at `.git/index` and needs one, a linked one
+        under `worktrees/` does not. Measured live: `apply` exited 0 on a linked
+        worktree and `check` then failed "no 'default:group:agent-dev:r-x'".
+        """
         source = pathlib.Path(aa.__file__).read_text(encoding='utf-8')
         # The check asks for read-only on the common dir...
         self.assertIn('read = AclSpec("group", group, "r-x")', source)
-        self.assertIn('self.check_grant(common, read, read.as_default(), "git")', source)
         # ...and no longer asks for write there.
         self.assertNotIn('self.check_grant(common, write, write.as_default(), "git")', source)
+        # The default entry is asked for from the SAME predicate `apply` uses.
+        self.assertIn('self_contained_index = common == Path(os.path.realpath(root)) / ".git"', source)
         # The writable subdirectories are still checked as writable.
         self.assertIn('for writable in ("objects", "refs", "logs", "worktrees")', source)
+
+    def test_a_plain_worktree_gets_a_default_entry_on_the_common_dir(self):
+        """Its index is `.git/index`, which the developer creates after the grant —
+        without a default entry the agent could not write its own index."""
+        ctx = self.context(roots=(self.wt,))
+        grants = [
+            g for g in self._grants(ctx)
+            if g['path'] == str(self.common) and not g['recursive']
+        ]
+        self.assertTrue(any(g['default'] for g in grants),
+                        'a plain worktree needs a default entry for its index')
+
+    def test_a_linked_worktree_gets_no_default_entry_on_the_common_dir(self):
+        """Its index is under `worktrees/`, which is granted recursively. A default
+        entry here is what made `apply` and `check` disagree."""
+        ctx = self.context(roots=(self.wt,))
+        # A real linked worktree: `.git` is a file naming the admin dir.
+        gitfile = self.wt / '.git'
+        shutil.rmtree(gitfile, ignore_errors=True)
+        admin = self.tmp / 'repo' / '.git'
+        (admin / 'worktrees' / 'wt').mkdir(parents=True)
+        gitfile.write_text(f'gitdir: {admin}/worktrees/wt\n', encoding='utf-8')
+        ctx.runner = FakeRunner()
+
+        def exec_with_real_git(argv, input_text, capture):
+            if argv and argv[0] == 'git':
+                if '--git-common-dir' in argv:
+                    return aa.Result(0, f'{admin}\n', '')
+                return aa.Result(0, 'true\n', '')
+            return FakeRunner._exec(ctx.runner, argv, input_text, capture)
+
+        ctx.runner._exec = exec_with_real_git
+        ctx.git = aa.Git(ctx.runner, accounts=ctx.accounts, agent_user=AGENT)
+        grants = [
+            g for g in aa.acl_grants(ctx.cfg, ctx, str(self.agent_home))
+            if g['path'] == str(admin) and not g['recursive'] and g.get('permissions') == 'r-x'
+        ]
+        self.assertEqual(1, len(grants))
+        self.assertFalse(grants[0]['default'], 'a linked worktree needs no default entry')
 
     def test_only_the_directories_git_writes_are_granted_recursively(self):
         """objects, refs, logs, worktrees — and nothing else. Measured: with exactly

@@ -538,10 +538,34 @@ class Git:
         self.accounts = accounts or SystemAccounts()
         self.agent_user = agent_user
 
+    @staticmethod
+    def _trust(root: Path) -> list[str]:
+        """`-c safe.directory=<root>`: git's ownership guard must not hide the repo.
+
+        `apply` runs `validate_roots` TWICE — as the developer before `elevate`, then
+        again in the root half after the sudo re-exec. As root, git ≥2.35 refuses a
+        worktree owned by another uid ("dubious ownership") unless the path is in
+        `safe.directory`, and the sanitized environment deliberately gives root
+        `HOME=/root`, whose gitconfig has no such entry. Measured on Fedora 45 /
+        git 2.56: invoking as the developer passed, the root half answered
+        "/path is not a git worktree" for a correctly provisioned root — so `apply`
+        could never complete on a host where the developer owns the worktree.
+
+        This does not weaken git's guard: the path is the one the operator named on
+        the command line, and the ownership question that matters here (is the
+        `.git` pointer agent-writable?) is answered by `_safe_common_dir` from
+        `lstat`, not by git. One entry covers both `rev-parse` calls and both
+        layouts — measured for a plain and a linked worktree.
+        """
+        return ["-c", f"safe.directory={root}"]
+
     def is_worktree(self, path: Path | str) -> bool:
         # `--git-common-dir` cannot answer this: on a bare repository it prints
         # "." and exits 0, while `--is-inside-work-tree` says false.
-        res = self.runner.capture("git", "-C", str(path), "rev-parse", "--is-inside-work-tree")
+        root = Path(os.path.realpath(path))
+        res = self.runner.capture(
+            "git", *self._trust(root), "-C", str(path), "rev-parse", "--is-inside-work-tree"
+        )
         return res.rc == 0 and res.out.strip() == "true"
 
     def _resolve_common_dir(self, root: Path, common: str) -> Path:
@@ -566,7 +590,9 @@ class Git:
             raise AgentAccountError(f"{root} is not a git worktree: cannot stat .git: {error}") from error
         if stat.S_ISLNK(st.st_mode):
             raise AgentAccountError(f"{root}: .git is a symlink; refusing to trust it")
-        res = self.runner.capture("git", "-C", str(root), "rev-parse", "--git-common-dir")
+        res = self.runner.capture(
+            "git", *self._trust(root), "-C", str(root), "rev-parse", "--git-common-dir"
+        )
         common = res.out.strip()
         if res.rc != 0 or not common:
             raise AgentAccountError(f"{root} is not a git worktree")
@@ -1642,6 +1668,12 @@ def acl_grants(cfg: Config, ctx: Context, agent_home: str, *, state: str = "pres
                 }
             )
     for root in cfg.roots:
+        # Where git keeps this worktree's index decides whether `.git/` needs a
+        # default entry: `.git/index` for a plain worktree, `.git/worktrees/<name>/`
+        # (already granted recursively) for a linked one. ONE predicate, read by
+        # `apply` and `check` alike.
+        common = ctx.git.common_dir(root)
+        self_contained_index = common == Path(os.path.realpath(root)) / ".git"
         # The WORKTREE only. The common git dir is NOT granted here — it is handled
         # below, per subdirectory, because a recursive grant on `.git` itself lets
         # the agent rename a fresh `.git/config.lock` over `config` (POSIX rename
@@ -1686,7 +1718,6 @@ def acl_grants(cfg: Config, ctx: Context, agent_home: str, *, state: str = "pres
         #
         # The denial of `config` and `hooks` stays as well: belt and braces, so a
         # host that already carries them writable is repaired.
-        common = ctx.git.common_dir(root)
         for writable in ("objects", "refs", "logs", "worktrees"):
             directory = common / writable
             if not directory.is_dir():
@@ -1707,6 +1738,15 @@ def acl_grants(cfg: Config, ctx: Context, agent_home: str, *, state: str = "pres
         # `.git/` itself: traverse and read, never write. This is what makes the
         # rename-over-config impossible, and it must come AFTER the recursive grants
         # above so it is not undone by them.
+        #
+        # `default` is the ROOT's shape, not a constant: for a plain worktree the
+        # index lives at `.git/index`, so a default entry is what lets the agent
+        # write an index the developer creates. For a LINKED worktree the index is
+        # at `.git/worktrees/<name>/index` — inside the directory granted
+        # recursively above — so a default entry here is unnecessary and was the
+        # reason `apply` and `check` disagreed (measured: `apply` exited 0, `check`
+        # then failed "no 'default:group:agent-dev:r-x'"). `check` derives the same
+        # answer from the same predicate, so the two cannot drift.
         grants.append(
             {
                 "path": str(common),
@@ -1714,7 +1754,7 @@ def acl_grants(cfg: Config, ctx: Context, agent_home: str, *, state: str = "pres
                 "etype": "group",
                 "permissions": "r-x",
                 "recursive": False,
-                "default": False,
+                "default": self_contained_index,
                 "state": state,
             }
         )
@@ -2473,8 +2513,16 @@ class Checker:
             # a fresh `config.lock` be renamed over `config`. `apply` has always
             # written it that way; `check` asking for `rwx` failed every correctly
             # provisioned host — measured on the first live apply.
+            #
+            # The DEFAULT entry is asked for only where `apply` writes one: a plain
+            # worktree keeps its index at `.git/index`, a linked one under
+            # `worktrees/` (already granted). Same predicate as `acl_grants`, so a
+            # correct host cannot fail `check` — measured on the live run.
             read = AclSpec("group", group, "r-x")
-            self.check_grant(common, read, read.as_default(), "git")
+            self_contained_index = common == Path(os.path.realpath(root)) / ".git"
+            self.check_grant(
+                common, read, read.as_default() if self_contained_index else None, "git"
+            )
             # ...while the directories git actually writes must be writable.
             for writable in ("objects", "refs", "logs", "worktrees"):
                 directory = common / writable
