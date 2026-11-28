@@ -207,8 +207,9 @@ secure_tmp_root() {
     assert_trusted "$local_parent"
     SECURE_TMPROOT=$(TMPDIR= mktemp -d "$local_parent/install-tmp.XXXXXX")
     chown root:root "$SECURE_TMPROOT"
-    chmod 0700 "$SECURE_TMPROOT"
-    assert_trusted "$SECURE_TMPROOT"
+    # Traverse-only for non-root: builder can reach its dedicated WORK dir by
+    # random name, but STAGE remains 0700 and the root is not listable.
+    chmod 0711 "$SECURE_TMPROOT"
     printf '%s\n' "$SECURE_TMPROOT"
 }
 
@@ -282,6 +283,13 @@ else
     LIB_CREATED=yes
 fi
 install -d -m 0755 -o root -g root "$LIB"
+
+# Created ONCE, at top level: `$(secure_mktemp_dir ...)` runs in a subshell, so an
+# assignment made inside it never reaches the caller. Measured without this line:
+# every `secure_mktemp_dir` call created its OWN `install-tmp.*` root, and
+# `cleanup`'s `rmdir "$SECURE_TMPROOT"` was a no-op because the variable was empty
+# here — two empty roots were left behind after a successful install.
+SECURE_TMPROOT=$(secure_tmp_root)
 
 # The builder runs as the CALLER and must be able to write its output here, so the
 # directory is owned by that user. The parent tmp root is trusted/root-only; WORK

@@ -467,6 +467,197 @@ class TrustedPathTest(unittest.TestCase):
         )
 
 
+def _extract_tmp_root_functions() -> str:
+    """`assert_trusted`, `secure_tmp_root` and `secure_mktemp_dir`, verbatim.
+
+    Extracted one at a time: a single range would span the `id -u` root check that
+    sits between them, and that would exit before the functions ran.
+    """
+    text = INSTALL_SH.read_text(encoding='utf-8')
+
+    def block(name: str) -> str:
+        start = text.index(f'{name}() {{')
+        return text[start:text.index('\n}\n', start) + len('\n}\n')]
+
+    return block('assert_trusted') + block('secure_tmp_root') + block('secure_mktemp_dir')
+
+
+def _shipped_tmp_wiring() -> str:
+    """The two lines of `install.sh` that CALL the staging helpers, verbatim.
+
+    Taken from the script rather than restated here: the bug this guards against is
+    the wiring (`SECURE_TMPROOT` must be assigned at top level, not inside `$(...)`),
+    and a restated copy would hide a regression instead of failing on it.
+    """
+    text = INSTALL_SH.read_text(encoding='utf-8')
+    once = next(line for line in text.splitlines() if line.startswith('SECURE_TMPROOT=$(secure_tmp_root)'))
+    work = next(line for line in text.splitlines() if line.startswith('WORK=$(secure_mktemp_dir work)'))
+    return f'SECURE_TMPROOT=""\n{once}\nprintf "ROOT=%s\\n" "$SECURE_TMPROOT"\n{work}\nprintf "WORK=%s\\n" "$WORK"\n'
+
+
+class SecureTmpRootTest(unittest.TestCase):
+    """Privileged staging must not live in a directory the caller can substitute.
+
+    An inherited `TMPDIR` is caller-controlled. The attack is not "read the staging
+    directory": it is REPLACING it — point `TMPDIR` at a directory the attacker
+    owns, let root create its staging tree there, and swap the path between the
+    build and the install. The install root must be created under a parent that is
+    validated (root-owned, no group/world write) and created 0700, never in
+    `$TMPDIR`.
+
+    Real directories, real modes, real `mktemp`; only `stat`'s ANSWER is shimmed,
+    because a test process cannot own a path as uid 0. The shim still answers with
+    the true mode of anything it was not told about, so the ancestor walk is real.
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix='aa-tmproot-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.fn = _extract_tmp_root_functions()
+        self.fake_root = self.tmp / 'fakeroot'
+        self.fake_root.mkdir()
+
+    def _run(self, *, inherited_tmpdir: pathlib.Path, parent: pathlib.Path,
+             hostile: pathlib.Path | None = None, hostile_mode: str | None = None,
+             hostile_uid: str = '0') -> subprocess.CompletedProcess:
+        shim = self.tmp / 'shim'
+        shim.mkdir(exist_ok=True)
+        (shim / 'stat').write_text(
+            textwrap.dedent("""\
+                #!/bin/sh
+                last=""; for a in "$@"; do last="$a"; done
+                # One path answers with the test's ownership/mode; everything else
+                # (including "/" and the parents above) is the real metadata.
+                if [ -n "${HOSTILE:-}" ] && [ "$last" = "$HOSTILE" ]; then
+                    case "$*" in
+                        *%u*) echo "${HOSTILE_UID:-0}"; exit 0 ;;
+                        *%a*) echo "${HOSTILE_MODE:-777}"; exit 0 ;;
+                    esac
+                fi
+                case "$*" in *%u*) echo 0; exit 0 ;; *%a*) echo 755; exit 0 ;; esac
+                """),
+            encoding='utf-8',
+        )
+        (shim / 'stat').chmod(0o755)
+        env = dict(
+            os.environ,
+            PATH=f'{shim}:/usr/sbin:/usr/bin:/sbin:/bin',
+            TMPDIR=str(inherited_tmpdir),
+            AGENT_ISOLATION_INSTALL_TMPROOT=str(parent),
+        )
+        if hostile_mode is not None:
+            env['HOSTILE'] = str(hostile or parent)
+            env['HOSTILE_UID'] = hostile_uid
+            env['HOSTILE_MODE'] = hostile_mode
+        script = 'set -eu\n' + self.fn + '\n' + _shipped_tmp_wiring()
+        # Real root semantics without root: `install -d -o root -g root` and the
+        # `set -eu` abort on a failed `$(secure_tmp_root)` are both part of what is
+        # under test, so the script runs where uid 0 can create root-owned paths.
+        probe = subprocess.run(['unshare', '--user', '--map-root-user', 'sh', '-c', 'exit 0'],
+                               capture_output=True, check=False)
+        if probe.returncode != 0:
+            self.skipTest('unprivileged user namespaces unavailable')
+        return subprocess.run(
+            ['unshare', '--user', '--map-root-user', '--mount', '--propagation', 'private',
+             'sh', '-c', script],
+            capture_output=True, text=True, check=False, env=env,
+        )
+
+    def _field(self, stdout: str, name: str) -> str:
+        for line in stdout.splitlines():
+            if line.startswith(f'{name}='):
+                return line.split('=', 1)[1]
+        self.fail(f'{name}= missing from {stdout!r}')
+
+    def test_the_staging_root_is_not_created_in_the_inherited_tmpdir(self):
+        """The whole point: `TMPDIR` names the ATTACKER's directory, and the
+        staging tree must not appear there."""
+        hostile = self.tmp / 'hostile-tmp'
+        hostile.mkdir()
+        hostile.chmod(0o777)
+        result = self._run(inherited_tmpdir=hostile, parent=self.fake_root / 'secure')
+        self.assertEqual(0, result.returncode, result.stderr)
+        root = pathlib.Path(self._field(result.stdout, 'ROOT'))
+        self.assertFalse(
+            str(root).startswith(str(hostile)),
+            f'the staging root was created in the inherited TMPDIR: {root}',
+        )
+        self.assertEqual([], list(hostile.iterdir()), 'nothing was created in $TMPDIR')
+
+    def test_the_staging_root_is_0700_root_owned(self):
+        parent = self.fake_root / 'secure'
+        result = self._run(inherited_tmpdir=self.tmp, parent=parent)
+        self.assertEqual(0, result.returncode, result.stderr)
+        root = pathlib.Path(self._field(result.stdout, 'ROOT'))
+        self.assertTrue(root.is_dir())
+        self.assertEqual(0o711, root.stat().st_mode & 0o777,
+                         '0711 is traverse-only: the builder reaches WORK by name, never lists the root')
+        # 0711 has no group/world WRITE bit; the execute bit is the deliberate
+        # traverse the builder needs, and is asserted above.
+        self.assertEqual(0, root.stat().st_mode & 0o022,
+                         'group/world write on the staging root would let the caller substitute it')
+
+    def test_a_group_or_world_writable_ancestor_is_refused(self):
+        """The substitution is an ANCESTOR, not the directory itself.
+
+        `install -d -m 0700` repairs the leaf it creates, so a writable leaf is not
+        the attack. A writable ANCESTOR is: whoever can write it can rename the whole
+        validated subtree away after the check and put their own in its place, so
+        the walk has to refuse it — which is what `assert_trusted` exists for.
+        """
+        ancestor = self.fake_root / 'evil'
+        ancestor.mkdir()
+        parent = ancestor / 'secure'
+        for mode in ('777', '775'):
+            result = self._run(inherited_tmpdir=self.tmp, parent=parent,
+                               hostile=ancestor, hostile_mode=mode)
+            self.assertNotEqual(0, result.returncode, f'ancestor mode {mode} was accepted')
+            self.assertIn('group- or world-writable', result.stderr)
+            self.assertFalse(parent.exists() and list(parent.iterdir()), 'nothing staged')
+            shutil.rmtree(parent, ignore_errors=True)
+
+    def test_a_foreign_owned_ancestor_is_refused(self):
+        """Ownership of the ancestor, not just its mode: root installing under a tree
+        somebody else owns is the same substitution without the write bits."""
+        ancestor = self.fake_root / 'foreign'
+        ancestor.mkdir()
+        result = self._run(inherited_tmpdir=self.tmp, parent=ancestor / 'secure',
+                           hostile=ancestor, hostile_mode='755', hostile_uid='12345')
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('not root', result.stderr)
+
+    def test_work_is_a_distinct_0700_directory_inside_the_staging_root(self):
+        parent = self.fake_root / 'secure'
+        result = self._run(inherited_tmpdir=self.tmp, parent=parent)
+        self.assertEqual(0, result.returncode, result.stderr)
+        root = pathlib.Path(self._field(result.stdout, 'ROOT'))
+        work = pathlib.Path(self._field(result.stdout, 'WORK'))
+        self.assertEqual(root, work.parent, 'WORK lives inside the staging root')
+        self.assertEqual(0o700, work.stat().st_mode & 0o777, 'WORK is root-only')
+
+    def test_both_directories_share_one_staging_root(self):
+        """Measured bug: `SECURE_TMPROOT` was assigned inside `$(...)`, so the
+        assignment never reached the caller. Every `secure_mktemp_dir` call then
+        created its OWN `install-tmp.*` root, and `cleanup`'s `rmdir` (an empty
+        variable at top level) removed nothing — two empty roots were left behind
+        after a successful install."""
+        parent = self.fake_root / 'secure'
+        result = self._run(inherited_tmpdir=self.tmp, parent=parent)
+        self.assertEqual(0, result.returncode, result.stderr)
+        root = pathlib.Path(self._field(result.stdout, 'ROOT'))
+        work = pathlib.Path(self._field(result.stdout, 'WORK'))
+        self.assertEqual(root, work.parent)
+        self.assertEqual(1, len(list(parent.iterdir())), 'one staging root, not one per call')
+
+    def test_cleanup_removes_the_staging_root_it_created(self):
+        """The variable has to be set at TOP level for `cleanup` to `rmdir` it."""
+        text = INSTALL_SH.read_text(encoding='utf-8')
+        self.assertIn('SECURE_TMPROOT=$(secure_tmp_root)', text,
+                      'the staging root is created once, at top level')
+        self.assertNotIn('$(secure_mktemp_dir work)', text[:text.index('SECURE_TMPROOT=$(secure_tmp_root)')],
+                         'WORK must not be created before SECURE_TMPROOT is set')
+
+
 def _extract_cleanup() -> str:
     """The `cleanup` function and its traps, verbatim, out of `install.sh`."""
     text = INSTALL_SH.read_text(encoding='utf-8')
@@ -788,19 +979,26 @@ class InstallLifecycleHarness:
                 """),
             encoding='utf-8',
         )
+        # A COPY, like `stat.real` above and for the same reason: `run_install`
+        # bind-mounts this shim OVER the real binary, so a shim that `exec`s the
+        # real path execs itself — an infinite loop that pegged a core per test.
         real_uv = shutil.which('uv', path='/usr/bin:/bin:/usr/sbin:/sbin') or 'uv'
         real_python = shutil.which('python3', path='/usr/bin:/bin:/usr/sbin:/sbin') or sys.executable
+        uv_real = self.shim / 'uv.real'
+        python_real = self.shim / 'python3.real'
+        shutil.copy2(real_uv, uv_real)
+        shutil.copy2(real_python, python_real)
         (self.shim / 'uv').write_text(
             textwrap.dedent(f"""\
                 #!/bin/sh
-                exec {real_uv!s} "$@"
+                exec {str(uv_real)!s} "$@"
                 """),
             encoding='utf-8',
         )
         (self.shim / 'python3').write_text(
             textwrap.dedent(f"""\
                 #!/bin/sh
-                exec {real_python!s} "$@"
+                exec {str(python_real)!s} "$@"
                 """),
             encoding='utf-8',
         )
@@ -817,6 +1015,7 @@ class InstallLifecycleHarness:
         env['PATH'] = f"{self.shim}:{env.get('PATH', '')}"
         # Make uv cache writable in constrained envs.
         env.setdefault('UV_CACHE_DIR', str(self.tmp / 'uv-cache'))
+        env.setdefault('AGENT_ISOLATION_INSTALL_TMPROOT', str(self.tmp / 'secure-tmp'))
         return env
 
     def run_install(self, *args, fail_at: str | None = None, timeout: int = 300):
@@ -852,9 +1051,10 @@ class InstallLifecycleHarness:
                               cwd=str(REPO_ROOT), timeout=timeout)
 
     def _install_failure_shims(self):
-        # These wrappers delegate to the real tool unless FAIL_AT matches.
-        real_uv = shutil.which('uv', path='/usr/bin:/bin:/usr/sbin:/sbin')
-        real_python = sys.executable
+        # These wrappers delegate to the real tool unless FAIL_AT matches. The real
+        # tool is the COPY, not the path this shim is bind-mounted over.
+        real_uv = self.shim / 'uv.real'
+        real_python = self.shim / 'python3.real'
         (self.shim / 'uv').write_text(
             textwrap.dedent(f"""\
                 #!/bin/sh

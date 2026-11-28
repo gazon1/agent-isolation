@@ -123,6 +123,7 @@ import pwd
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -151,8 +152,9 @@ from pydantic import (
 SELF_NAME = "agent-account"
 PLAYBOOK = Path(__file__).resolve().parent / "ansible" / "agent-account.yml"
 
-# Root-equivalent or device-owning. `docker` alone defeats every file permission.
-PRIVILEGED_GROUPS = ("wheel", "docker", "kvm")
+# Root-equivalent or device-owning. `docker` alone defeats every file permission;
+# `disk` exposes block devices, `lxd`/`incus-admin` grant container-root paths.
+PRIVILEGED_GROUPS = ("wheel", "docker", "kvm", "disk", "lxd", "incus-admin")
 SUDO_COMMAND = "/usr/bin/env"
 DEFAULT_STATE_DIR = Path("/var/lib/agent-account")
 DEFAULT_SUDOERS_PATH = Path("/etc/sudoers.d/50-agent-account")
@@ -310,16 +312,26 @@ TRUSTED_TMP_PARENT = Path("/var/lib/agent-isolation")
 
 
 def trusted_tmp_parent() -> Path:
-    """Root-controlled parent for privileged temporary files.
+    """Trusted parent for privileged temporary files.
 
     Inherited TMPDIR may be writable by the caller (or be in a non-sticky world-
     writable directory), which makes temp file names replaceable. Privileged
-    config/vars/staging must live under a trusted, root-owned 0700 parent.
+    config/vars/staging must live under a trusted 0700 parent. The default
+    /var/lib/agent-isolation must be root-owned; an explicit
+    AGENT_ISOLATION_TRUSTED_TMP override must be owned by the current euid (used
+    by tests/runs in isolated environments). Non-root runs without an override
+    use a user-owned 0700 directory under XDG_RUNTIME_DIR or the system temp dir.
     """
     override = os.environ.get("AGENT_ISOLATION_TRUSTED_TMP")
-    parent = Path(override) if override else TRUSTED_TMP_PARENT
+    if override:
+        parent = Path(override)
+    elif os.geteuid() == 0:
+        parent = TRUSTED_TMP_PARENT
+    else:
+        base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+        parent = Path(base) / "agent-isolation"
     try:
-        parent.mkdir(parents=True, exist_ok=True)
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as error:
         raise AgentAccountError(f"cannot create trusted temp parent {parent}: {error}") from error
     try:
@@ -328,8 +340,13 @@ def trusted_tmp_parent() -> Path:
         raise AgentAccountError(f"cannot stat trusted temp parent {parent}: {error}") from error
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
         raise AgentAccountError(f"trusted temp parent {parent} is not a directory")
-    if st.st_uid != 0:
-        raise AgentAccountError(f"trusted temp parent {parent} is owned by uid {st.st_uid}, not root")
+    if override or os.geteuid() != 0:
+        owner_ok = st.st_uid == os.geteuid()
+    else:
+        owner_ok = st.st_uid == 0
+    if not owner_ok:
+        owner = f"uid {os.geteuid()}" if (override or os.geteuid() != 0) else "root"
+        raise AgentAccountError(f"trusted temp parent {parent} is owned by uid {st.st_uid}, not {owner}")
     if st.st_mode & 0o077:
         raise AgentAccountError(f"trusted temp parent {parent} must not be group/world accessible")
     return parent
@@ -340,7 +357,9 @@ def _safe_subprocess_env(environ: Mapping[str, str] | None = None) -> dict[str, 
 
     The caller's environment is untrusted: PATH/PYTHON*/UV*/GIT*/ANSIBLE*/TMPDIR
     can redirect binary, module, or temp-file resolution. We keep a small
-    allowlist and set fixed PATH/locale/TMPDIR.
+    allowlist and set fixed PATH/locale. For root, TMPDIR is forced to a trusted
+    root-owned parent; for non-root, inherited TMPDIR is dropped and the system
+    default temp directory is used.
     """
     base = dict(os.environ if environ is None else environ)
     allowed = {"HOME", "LANG", "LC_CTYPE", "LC_MESSAGES", "LOGNAME", "SHELL", "TERM", "TZ", "USER"}
@@ -354,7 +373,10 @@ def _safe_subprocess_env(environ: Mapping[str, str] | None = None) -> dict[str, 
         lang = "C.UTF-8"
     env["LANG"] = lang
     env["LC_ALL"] = "C"
-    env["TMPDIR"] = str(trusted_tmp_parent())
+    if os.geteuid() == 0 or os.environ.get("AGENT_ISOLATION_TRUSTED_TMP"):
+        env["TMPDIR"] = str(trusted_tmp_parent())
+    else:
+        env["TMPDIR"] = tempfile.gettempdir()
     return env
 
 
@@ -511,8 +533,10 @@ def is_within(path: str, base: str) -> bool:
 
 
 class Git:
-    def __init__(self, runner: Runner):
+    def __init__(self, runner: Runner, accounts: SystemAccounts | None = None, agent_user: str = "agent"):
         self.runner = runner
+        self.accounts = accounts or SystemAccounts()
+        self.agent_user = agent_user
 
     def is_worktree(self, path: Path | str) -> bool:
         # `--git-common-dir` cannot answer this: on a bare repository it prints
@@ -520,22 +544,116 @@ class Git:
         res = self.runner.capture("git", "-C", str(path), "rev-parse", "--is-inside-work-tree")
         return res.rc == 0 and res.out.strip() == "true"
 
+    def _resolve_common_dir(self, root: Path, common: str) -> Path:
+        resolved = Path(common)
+        if not resolved.is_absolute():
+            resolved = root / resolved
+        return Path(os.path.realpath(resolved))
+
+    def _safe_common_dir(self, root: Path) -> Path:
+        """Resolve a worktree's common dir without trusting an agent-writable pointer.
+
+        A linked worktree's `.git` file contains `gitdir: ...` and is inside the
+        authorized root, so a recursive rwX grant makes it writable. We only trust
+        git's resolution when the `.git` entry itself is not a symlink and, for a
+        linked worktree, not group/world writable.
+        """
+        root = Path(os.path.realpath(root))
+        dot_git = root / ".git"
+        try:
+            st = os.lstat(dot_git)
+        except OSError as error:
+            raise AgentAccountError(f"{root} is not a git worktree: cannot stat .git: {error}") from error
+        if stat.S_ISLNK(st.st_mode):
+            raise AgentAccountError(f"{root}: .git is a symlink; refusing to trust it")
+        res = self.runner.capture("git", "-C", str(root), "rev-parse", "--git-common-dir")
+        common = res.out.strip()
+        if res.rc != 0 or not common:
+            raise AgentAccountError(f"{root} is not a git worktree")
+        resolved = self._resolve_common_dir(root, common)
+        if stat.S_ISREG(st.st_mode):
+            agent_uid = None
+            agent_entry = self.accounts.passwd(self.agent_user)
+            if agent_entry is not None:
+                agent_uid = agent_entry.uid
+            if agent_uid is not None and st.st_uid == agent_uid:
+                raise AgentAccountError(
+                    f"{root}: linked worktree .git pointer is owned by agent uid {st.st_uid}; refusing to trust redirected git metadata"
+                )
+            if st.st_mode & 0o022:
+                raise AgentAccountError(
+                    f"{root}: linked worktree .git pointer is group/world writable; refusing to trust redirected git metadata"
+                )
+            content = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+            if not content.startswith("gitdir:"):
+                raise AgentAccountError(f"{root}: .git file does not contain a gitdir pointer")
+            raw = content.split(":", 1)[1].strip()
+            pointer_target = Path(raw)
+            if not pointer_target.is_absolute():
+                pointer_target = (root / pointer_target).resolve()
+            else:
+                pointer_target = pointer_target.resolve()
+            # A worktree's pointer names its ADMIN dir — `<common>/worktrees/<name>`,
+            # NOT the common dir. Comparing the two (measured: every real
+            # `git worktree add` was refused) rejected the supported layout. The
+            # invariant is the containment, and it is what catches redirection: a
+            # pointer naming an unrelated store lands outside `resolved/worktrees`.
+            expected_worktrees = resolved / "worktrees"
+            if Path(os.path.realpath(pointer_target.parent)) != Path(os.path.realpath(expected_worktrees)):
+                raise AgentAccountError(
+                    f"{root}: .git pointer targets {pointer_target}, which is not a worktree admin dir under "
+                    f"{expected_worktrees} (git reports common dir {resolved})"
+                )
+        return resolved
+
     def common_dir(self, path: Path | str) -> Path:
         """The object store a worktree writes to.
 
         One clone with many worktrees shares exactly one of these, and it is NOT
         under the worktree: a linked worktree only carries a `.git` file.
         """
-        if not self.is_worktree(path):
+        root = Path(os.path.realpath(path))
+        if not self.is_worktree(root):
             raise AgentAccountError(f"{path} is not a git worktree")
-        res = self.runner.capture("git", "-C", str(path), "rev-parse", "--git-common-dir")
-        common = res.out.strip()
-        if res.rc != 0 or not common:
-            raise AgentAccountError(f"{path} is not a git worktree")
-        resolved = Path(common)
-        if not resolved.is_absolute():
-            resolved = Path(path) / resolved
-        return Path(os.path.realpath(resolved))
+        return self._safe_common_dir(root)
+
+    def dot_git_path(self, path: Path | str) -> Path:
+        root = Path(os.path.realpath(path))
+        dot_git = root / ".git"
+        if not dot_git.exists() and not dot_git.is_symlink():
+            raise AgentAccountError(f"{root} is not a git worktree")
+        return dot_git
+
+    def nested_git_entries(self, root: Path | str) -> list[Path]:
+        """Find nested repositories/submodules/worktrees inside an authorized root.
+
+        A recursive rwX grant on the root covers every nested `.git` metadata path
+        unless we explicitly protect or refuse it.
+        """
+        root = Path(os.path.realpath(root))
+        found: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            current = Path(dirpath)
+            # Skip the root worktree's own .git; it is handled separately.
+            if current == root:
+                dirnames[:] = [d for d in dirnames if d != ".git"]
+                if ".git" in filenames:
+                    filenames.remove(".git")
+                continue
+            for name in list(dirnames):
+                if name == ".git":
+                    found.append((current / name).resolve())
+                    dirnames.remove(name)
+            if ".git" in filenames:
+                found.append((current / ".git").resolve())
+        # Deduplicate while preserving order.
+        seen: set[Path] = set()
+        result: list[Path] = []
+        for item in found:
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
 
 
 class Ansible:
@@ -680,7 +798,7 @@ class Context:
         self.cfg = cfg
         self.runner = runner
         self.accounts = accounts
-        self.git = git or Git(runner)
+        self.git = git or Git(runner, accounts=accounts, agent_user=cfg.agent_user)
         self.ansible = ansible or Ansible(cfg, runner)
 
     def agent_home(self) -> str:
@@ -725,10 +843,38 @@ class Context:
         resolved = os.path.realpath(home)
         if resolved == "/":
             return "it is / — apply would write the agent's state into the root"
+        # Refuse obvious system/unsafe locations for adopted homes.
+        unsafe_prefixes = (
+            "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/var/lib",
+            "/proc", "/sys", "/dev", "/boot", "/run", "/srv", "/media", "/mnt",
+        )
+        for prefix in unsafe_prefixes:
+            if is_within(resolved, prefix):
+                return f"it is under system path {prefix} ({resolved}) — not a dedicated private home"
+        if resolved == "/home" or resolved.startswith("/home/"):
+            agent_home_default = f"/home/{self.cfg.agent_user}"
+            if resolved != agent_home_default and not resolved.startswith(agent_home_default + "/"):
+                return f"it is under /home but not the agent's own home ({resolved})"
         dev_home = str(self.cfg.dev_home)
         for forbidden in {dev_home, os.path.realpath(dev_home)}:
             if is_within(resolved, forbidden):
                 return f"it is inside the developer's home ({resolved}) — it is the same identity's files"
+        try:
+            st = os.lstat(home)
+        except FileNotFoundError:
+            # Missing home is allowed for a fresh account; useradd/playbook creates it.
+            return ""
+        except OSError as error:
+            return f"cannot stat {home}: {error}"
+        if stat.S_ISLNK(st.st_mode):
+            return f"it is a symlink ({home}) — refusing unsafe adopted home"
+        if not stat.S_ISDIR(st.st_mode):
+            return f"it is not a directory ({home})"
+        agent = self.accounts.passwd(self.cfg.agent_user)
+        if agent is not None and st.st_uid not in (agent.uid, 0, os.geteuid()):
+            return f"it is owned by uid {st.st_uid}, not {self.cfg.agent_user} or root"
+        if st.st_mode & 0o077:
+            return f"it is group/world accessible (mode {stat.S_IMODE(st.st_mode):#o})"
         return ""
 
     def require_own_home(self, home: str) -> None:
@@ -1425,11 +1571,16 @@ def acl_grants(cfg: Config, ctx: Context, agent_home: str, *, state: str = "pres
         provisioning detail; the snapshot would restore it, but only at rollback, and
         the expansion lasts for the whole time the agent works.
         """
-        entries = [
-            e
-            for e in parse_getfacl(ctx.runner.capture("getfacl", "--absolute-names", str(path)).out)
-            if e.default == default
-        ]
+        facl = ctx.runner.capture("getfacl", "--absolute-names", str(path))
+        if facl.rc != 0:
+            detail = (facl.err or facl.out).strip() or f"exit {facl.rc}"
+            raise AgentAccountError(
+                f"{path}: cannot read ACLs with getfacl ({detail}); refusing to compute mask changes"
+            )
+        parsed = parse_getfacl(facl.out)
+        if facl.out.strip() and not parsed and "# file:" not in facl.out:
+            raise AgentAccountError(f"{path}: getfacl returned unexpected output; refusing to compute mask changes")
+        entries = [e for e in parsed if e.default == default]
         if mask_covers(entries, needed, path.is_dir(), default=default):
             return True
         # BOTH of this tool's identities are exempt in ONE call: a path grants the
@@ -1567,6 +1718,32 @@ def acl_grants(cfg: Config, ctx: Context, agent_home: str, *, state: str = "pres
                 "state": state,
             }
         )
+        # Linked worktree .git pointer file lives in the authorized root and would be
+        # writable via the root recursive rwX grant. Deny group ACL entries on it and
+        # force the pointer to be root-owned and not group/world writable.
+        dot_git = Path(os.path.realpath(root)) / ".git"
+        if dot_git.is_file() and not dot_git.is_symlink():
+            for default in (False, True):
+                grants.append(
+                    {
+                        "path": str(dot_git),
+                        "entity": cfg.agent_group,
+                        "etype": "group",
+                        "default": default,
+                        "recursive": False,
+                        "state": "absent",
+                    }
+                )
+            grants.append(
+                {
+                    "path": str(dot_git),
+                    "entity": cfg.agent_user,
+                    "etype": "user",
+                    "default": False,
+                    "recursive": False,
+                    "state": "absent",
+                }
+            )
         # And the two paths that must carry no grant at all, access or default: a host
         # that already has them writable is repaired here, and `check` fails on them.
         for denied in (common / "config", common / "hooks"):
@@ -1614,6 +1791,11 @@ class Provisioner:
         # refused host is untouched and rollback has a record to work from.
         removed = self._record_account(account)
         updates = self._record_memberships(account, removed)
+        # Sudo preflight before provisioning: adopted accounts are checked before
+        # any write. Newly created accounts are checked after identity/group setup
+        # but before granting worktree access.
+        if account is not None:
+            self.audit_sudo(preflight=True)
         self._snapshot_targets(agent_home)
         self._install_sudoers()
         group_exists = self.accounts.group(cfg.agent_group) is not None
@@ -1627,28 +1809,42 @@ class Provisioner:
                     continue
                 state = " --append" if update.get("append") else ""
                 print(f"usermod{state} --groups {','.join(update['groups'])} {update['name']}")
-        if cfg.dry_run and account is None:
-            # `setfacl` resolves the entry's NAME while it plans, so a host without
-            # the account cannot be asked what the grant would be. The plan says it
-            # in the shell form the reader can check, like the memberships above.
-            for grant in acl_grants(cfg, self.ctx, agent_home):
-                recurse = "--recursive " if grant["recursive"] else ""
-                # `default:` is a PREFIX of the entry, not a field after the entity.
-                default = "default:" if grant["default"] else ""
-                entity = f"{default}{grant['etype']}:{grant['entity']}"
-                if grant.get("state") == "absent":
-                    # The denial of the shared store's `config` and `hooks`: printed
-                    # too, because a plan that hides a removal is not the plan.
-                    print(f"setfacl {recurse}-x {entity} {grant['path']}")
-                    continue
-                mask = " --no-mask" if grant.get("preserve_mask") else ""
-                print(f"setfacl{mask} {recurse}--modify {entity}:{grant['permissions']} {grant['path']}")
-        self.ctx.ansible.run(self._variables(agent_home, account, updates), check=cfg.dry_run)
         if cfg.dry_run:
+            if account is None:
+                # `setfacl` resolves the entry's NAME while it plans, so a host without
+                # the account cannot be asked what the grant would be. The plan says it
+                # in the shell form the reader can check, like the memberships above.
+                for grant in acl_grants(cfg, self.ctx, agent_home):
+                    recurse = "--recursive " if grant["recursive"] else ""
+                    # `default:` is a PREFIX of the entry, not a field after the entity.
+                    default = "default:" if grant["default"] else ""
+                    entity = f"{default}{grant['etype']}:{grant['entity']}"
+                    if grant.get("state") == "absent":
+                        # The denial of the shared store's `config` and `hooks`: printed
+                        # too, because a plan that hides a removal is not the plan.
+                        print(f"setfacl {recurse}-x {entity} {grant['path']}")
+                        continue
+                    mask = " --no-mask" if grant.get("preserve_mask") else ""
+                    print(f"setfacl{mask} {recurse}--modify {entity}:{grant['permissions']} {grant['path']}")
+            self.ctx.ansible.run(self._variables(agent_home, account, updates), check=True)
             print("=== plan only; re-run without --dry-run as root to apply ===")
             return
-        # LAST, for every account, and after the collaboration-group membership is in place:
-        # a rule this account can reach is the escalation the whole change forbids.
+
+        # Phase 1: identity/group/home/private dirs/memberships, no worktree ACL grants.
+        self.ctx.ansible.run(
+            self._variables(agent_home, account, updates, include_acl_grants=False),
+            check=False,
+        )
+        if account is None:
+            # Newly created account: verify effective sudo permissions after
+            # identity/group setup and before granting worktree access.
+            self.audit_sudo(preflight=True, account_expected=True)
+        # Phase 2: grant worktree/SDK/toolchain ACLs after sudo preflight.
+        self.ctx.ansible.run(
+            self._variables(agent_home, self.accounts.passwd(cfg.agent_user), updates, include_acl_grants=True),
+            check=False,
+        )
+        # Defense in depth: final audit after all provisioning.
         self.audit_sudo()
         roots = " ".join(shlex.quote(str(r)) for r in cfg.roots)
         print(f"=== done; verify with: {SELF_NAME} check {roots} ===")
@@ -1800,7 +1996,10 @@ class Provisioner:
             return
         result = self.runner.capture("getfacl", *flags, key)
         if result.rc != 0:
-            raise AgentAccountError(f"could not snapshot the ACL of {target}")
+            detail = (result.err or result.out).strip() or f"exit {result.rc}"
+            raise AgentAccountError(f"could not snapshot the ACL of {target}: {detail}")
+        if result.out.strip() and not parse_getfacl(result.out) and "# file:" not in result.out:
+            raise AgentAccountError(f"could not snapshot the ACL of {target}: unexpected getfacl output")
         if upgrade:
             eprint(f"note: {target} was recorded as '{record.kind}'; upgraded to tree")
         self.journal.target(key, kind, self.store.write_dump(key, result.out))
@@ -1819,11 +2018,19 @@ class Provisioner:
         if self.cfg.dry_run:
             self.runner.plan(f"printf '%s\\n' {shlex.quote(rule)} > {shlex.quote(str(path))}")
             return
-        if path.exists():
+        if path.exists() or path.is_symlink():
+            if path.is_symlink():
+                raise AgentAccountError(
+                    f"{path} is a symlink; refusing to replace or follow it — inspect it, then remove it by hand"
+                )
             # One matching line is not proof: a file that ALSO holds other
             # administrators' grants would lose them. It is ours only when it is
             # exactly this one rule — and then it is ADOPTION, not authorship.
-            if path.read_text(encoding="utf-8").strip() != rule:
+            try:
+                current = path.read_text(encoding="utf-8").strip()
+            except OSError as error:
+                raise AgentAccountError(f"cannot read {path}: {error}") from error
+            if current != rule:
                 raise AgentAccountError(
                     f"{path} holds content this script did not write — inspect it, then remove it by hand"
                 )
@@ -1868,7 +2075,14 @@ class Provisioner:
                 tmp.unlink()
             raise
 
-    def _variables(self, agent_home: str, account: PasswdEntry | None, updates: list[dict[str, object]]) -> dict:
+    def _variables(
+        self,
+        agent_home: str,
+        account: PasswdEntry | None,
+        updates: list[dict[str, object]],
+        *,
+        include_acl_grants: bool = True,
+    ) -> dict:
         cfg = self.cfg
         created = account is None
         return {
@@ -1886,22 +2100,41 @@ class Provisioner:
             "agent_group_exists": self.accounts.group(cfg.agent_group) is not None,
             "agent_user_exists": account is not None,
             "agent_user_updates": updates,
-            "agent_acl_grants": acl_grants(cfg, self.ctx, agent_home),
+            "agent_acl_grants": acl_grants(cfg, self.ctx, agent_home) if include_acl_grants else [],
         }
 
-    def audit_sudo(self) -> None:
+    def audit_sudo(self, *, preflight: bool = False, account_expected: bool = False) -> None:
         """The escalation this change forbids: a sudo rule for `agent`, or one that
         reaches it through the collaboration group.
 
-        This script does not edit somebody else's sudoers line and cannot read
-        another user's rules without root, so an unreadable answer is a WARNING and
-        not a pass: a run that could not verify is not a run that verified.
+        Preflight runs before provisioning work that would grant worktree access.
+        For a missing account there is nothing to audit yet. An unreadable answer
+        is a warning only for the final post-provisioning audit; a preflight that
+        cannot verify effective sudo rights refuses to continue.
         """
         agent = self.cfg.agent_user
+        account = self.accounts.passwd(agent)
+        if account is None and not account_expected:
+            return
         result = self.runner.capture("sudo", "--non-interactive", "--list", f"--other-user={agent}")
         if result.rc != 0:
-            eprint(f"note: {agent}'s sudo rights are unverified here (needs root to read);")
-            eprint(f"      run '{SELF_NAME} check' after provisioning")
+            probe = self.runner.capture(
+                "sudo", "--non-interactive", f"--user={agent}", "--",
+                SUDO_COMMAND, "-i", "PATH=/usr/local/bin:/usr/bin:/bin",
+                "/usr/bin/sudo", "-n", "true",
+            )
+            if probe.rc == 0:
+                raise AgentAccountError(f"{agent} CAN run sudo — it can leave its account")
+            listing = (result.err or result.out or "").lower()
+            definitely_absent = "unknown user" in listing or "no such user" in listing
+            if preflight and not definitely_absent:
+                raise AgentAccountError(
+                    f"{agent}'s sudo rights cannot be verified before provisioning; "
+                    f"run as root or verify with '{SELF_NAME} check' before apply"
+                )
+            if not definitely_absent:
+                eprint(f"note: {agent}'s sudo rights are unverified here (needs root to read);")
+                eprint(f"      run '{SELF_NAME} check' after provisioning")
             return
         rules = parse_sudo_rules(result.out)
         if rules:
@@ -1939,6 +2172,32 @@ def validate_roots(ctx: Context) -> None:
         in_home_guard(ctx.cfg, root)
         if not ctx.git.is_worktree(root):
             raise AgentAccountError(f"{root} is not a git worktree")
+        # Resolve common dir through the safe path so agent-writable .git pointers
+        # cannot redirect provisioning to an arbitrary git metadata directory.
+        ctx.git.common_dir(root)
+        _require_no_nested_git_metadata(root)
+
+
+def _require_no_nested_git_metadata(root: Path) -> None:
+    """Refuse nested repositories/submodules inside an authorized root.
+
+    A recursive rwX grant covers nested `.git/config` and `.git/hooks`, which can
+    be used for code execution when the developer operates that nested repo. Until
+    per-nested-repo protection is implemented, refuse them explicitly.
+    """
+    root = Path(os.path.realpath(root))
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        current = Path(dirpath)
+        if current == root:
+            # The root worktree's own .git is handled by the top-level checks.
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            continue
+        if ".git" in dirnames or ".git" in filenames:
+            nested = current / ".git"
+            raise AgentAccountError(
+                f"{root}: nested git metadata at {nested} is not supported; "
+                "authorize a root without nested repositories/submodules, or remove them"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2071,7 +2330,18 @@ class Checker:
 
     def read_acl(self, path: Path) -> list[AclEntry]:
         result = self.runner.capture("getfacl", "--absolute-names", str(path))
-        return parse_getfacl(result.out) if result.rc == 0 else []
+        if result.rc != 0:
+            detail = (result.err or result.out).strip() or f"exit {result.rc}"
+            raise AgentAccountError(f"{path}: cannot read ACLs with getfacl ({detail})")
+        # Output that is neither entries nor `# file:` headers is not an empty ACL:
+        # it is an answer we could not read, and calling it "no entry" reported a
+        # FAIL for the wrong reason on a host where `getfacl` misbehaved.
+        entries = parse_getfacl(result.out)
+        if result.out.strip() and not entries and "# file:" not in result.out:
+            raise AgentAccountError(
+                f"{path}: cannot read ACLs with getfacl (unexpected output)"
+            )
+        return entries
 
     def check_grant(
         self,
@@ -2084,7 +2354,11 @@ class Checker:
         if not target.exists():
             report.fail(f"missing path: {target}")
             return
-        entries = self.read_acl(target)
+        try:
+            entries = self.read_acl(target)
+        except AgentAccountError as error:
+            report.fail(str(error))
+            return
         is_dir = target.is_dir()
         # The entry has to be EFFECTIVE, not merely present: the ACL mask constrains
         # every named entry. A `group:agent-dev:rwx` under `mask::r-x` is a read-only
@@ -2122,7 +2396,11 @@ class Checker:
         """
         if not target.exists():
             return
-        entries = self.read_acl(target)
+        try:
+            entries = self.read_acl(target)
+        except AgentAccountError as error:
+            self.report.fail(str(error))
+            return
         live = [
             str(entry)
             for entry in entries
@@ -2144,8 +2422,13 @@ class Checker:
         # the named-only predicate was measured to pass a home carrying
         # `default:other::r--`, which makes every file created there mode 644
         # through the traverse grant. See `home_read_grant`.
+        try:
+            home_entries = self.read_acl(cfg.dev_home)
+        except AgentAccountError as error:
+            report.fail(str(error))
+            home_entries = []
         read_grants = home_read_grant(
-            self.read_acl(cfg.dev_home),
+            home_entries,
             agent,
             self.accounts.groups_of(agent),
             owner_group=owner_group_of(cfg.dev_home),
@@ -2180,8 +2463,12 @@ class Checker:
             if not self.ctx.git.is_worktree(root):
                 report.fail(f"{root} is not a git worktree")
                 continue
+            try:
+                common = self.ctx.git.common_dir(root)
+            except AgentAccountError as error:
+                report.fail(str(error))
+                continue
             self.check_grant(root, write, write.as_default(), "git")
-            common = self.ctx.git.common_dir(root)
             # `.git` itself is `r-x`, NOT `rwx`: write on the directory is what lets
             # a fresh `config.lock` be renamed over `config`. `apply` has always
             # written it that way; `check` asking for `rwx` failed every correctly
@@ -2197,6 +2484,24 @@ class Checker:
             # them and a check that never looks would certify the escalation.
             self.check_denied(common / "config", AclSpec("group", group, "rwX"))
             self.check_denied(common / "hooks", AclSpec("group", group, "rwX"))
+            dot_git = Path(os.path.realpath(root)) / ".git"
+            if dot_git.is_file() and not dot_git.is_symlink():
+                self.check_denied(dot_git, AclSpec("group", group, "rwX"))
+                self.check_denied(dot_git, AclSpec("user", agent, "rwX"))
+                try:
+                    st = os.lstat(dot_git)
+                except OSError as error:
+                    report.fail(f"{dot_git}: cannot stat linked worktree pointer: {error}")
+                    continue
+                if st.st_mode & 0o022:
+                    report.fail(f"{dot_git}: linked worktree pointer is group/world writable")
+                else:
+                    report.ok(f"{dot_git}: linked worktree pointer is not group/world writable")
+                agent_entry = self.accounts.passwd(agent)
+                if agent_entry is not None and st.st_uid == agent_entry.uid:
+                    report.fail(f"{dot_git}: linked worktree pointer is owned by {agent}")
+                else:
+                    report.ok(f"{dot_git}: linked worktree pointer is not owned by {agent}")
 
     # -- behaviour ----------------------------------------------------------
 

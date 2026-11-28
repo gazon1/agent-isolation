@@ -33,6 +33,7 @@ What is pinned here, in the order the suite reads:
 
 import importlib.util
 import io
+import os
 import pathlib
 import shutil
 import subprocess
@@ -260,7 +261,7 @@ class Base(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = self.tmp / 'home'
         self.agent_home = self.tmp / 'agent'
-        self.agent_home.mkdir(parents=True)
+        self.agent_home.mkdir(mode=0o700, parents=True)
         for rel in ('Android/Sdk', '.local/share/mise', '.local/bin'):
             (self.home / rel).mkdir(parents=True)
         self.wt = self.tmp / 'wt'
@@ -357,6 +358,7 @@ class RefusalTest(Base):
     def test_a_worktree_inside_the_home_needs_an_explicit_opt_in(self):
         inside = self.home / 'work' / 'wt'
         inside.mkdir(parents=True)
+        (inside / '.git').mkdir()
         ctx = self.context(roots=(inside,))
         with self.assertRaises(aa.AgentAccountError) as caught:
             aa.validate_roots(ctx)
@@ -423,6 +425,233 @@ class RefusalTest(Base):
                 ctx.accounts.passwd(AGENT), []
             )
         self.assertIn('mallory', str(caught.exception))
+
+    def test_adopted_unsafe_system_home_is_refused(self):
+        for home in ('/etc', '/var/lib'):
+            ctx = self.context(agent_home=home)
+            problem = ctx.home_problem(home)
+            self.assertTrue(problem, home)
+        ctx = self.context(agent_home='/home/another-user')
+        problem = ctx.home_problem('/home/another-user')
+        self.assertTrue(problem)
+
+    def test_adopted_symlink_home_is_refused(self):
+        home = self.tmp / 'agent-home-link'
+        home.symlink_to(self.tmp / 'elsewhere')
+        ctx = self.context(agent_home=str(home))
+        problem = ctx.home_problem(str(home))
+        self.assertIn('symlink', problem)
+
+    def test_adopted_world_readable_home_is_refused(self):
+        home = self.tmp / 'agent-home-open'
+        home.mkdir(mode=0o755)
+        ctx = self.context(agent_home=str(home))
+        problem = ctx.home_problem(str(home))
+        self.assertIn('group/world accessible', problem)
+
+    def test_nested_git_metadata_is_rejected(self):
+        nested = self.wt / 'sub'
+        nested.mkdir()
+        (nested / '.git').mkdir()
+        ctx = self.context(roots=(self.wt,))
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            aa.validate_roots(ctx)
+        self.assertIn('nested git metadata', str(caught.exception))
+
+    def test_nested_git_file_is_rejected(self):
+        nested = self.wt / 'submodule'
+        nested.mkdir()
+        (nested / '.git').write_text('gitdir: ../.git/modules/submodule\n', encoding='utf-8')
+        ctx = self.context(roots=(self.wt,))
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            aa.validate_roots(ctx)
+        self.assertIn('nested git metadata', str(caught.exception))
+
+    def test_linked_worktree_git_pointer_refuses_agent_owned_pointer(self):
+        root = self.tmp / 'wt-linked'
+        root.mkdir()
+        gitfile = root / '.git'
+        gitdir = self.tmp / 'repo' / '.git' / 'worktrees' / 'wt-linked'
+        gitdir.mkdir(parents=True)
+        gitfile.write_text(f'gitdir: {gitdir}\n', encoding='utf-8')
+        import os as _os
+        if hasattr(_os, 'chown'):
+            try:
+                _os.chown(gitfile, 2001, -1)
+            except PermissionError:
+                self.skipTest('chown not permitted')
+        else:
+            self.skipTest('chown not available')
+        ctx = self.context(roots=(root,))
+        ctx.git = aa.Git(ctx.runner, accounts=ctx.accounts, agent_user=AGENT)
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            ctx.git.common_dir(root)
+        self.assertIn('agent uid', str(caught.exception))
+
+    def test_linked_worktree_git_pointer_refuses_group_writable(self):
+        root = self.tmp / 'wt-linked2'
+        root.mkdir()
+        gitfile = root / '.git'
+        gitdir = self.tmp / 'repo2' / '.git' / 'worktrees' / 'wt-linked2'
+        gitdir.mkdir(parents=True)
+        gitfile.write_text(f'gitdir: {gitdir}\n', encoding='utf-8')
+        gitfile.chmod(0o664)
+        ctx = self.context(roots=(root,))
+        ctx.git = aa.Git(ctx.runner, accounts=ctx.accounts, agent_user=AGENT)
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            ctx.git.common_dir(root)
+        self.assertIn('group/world writable', str(caught.exception))
+
+
+class LinkedWorktreeCheckTest(Base):
+    """`check` must verify the same `.git` pointer invariants `apply` enforces.
+
+    A linked worktree's `.git` is a small FILE inside the authorized root, so the
+    root's recursive rwX grant covers it. Whoever writes that file chooses where
+    git will look for `config` and `hooks` — which are programs git runs as the
+    DEVELOPER. `apply` refuses a pointer it does not trust and denies ACL entries
+    on it; a `check` that never looked would certify that escalation as clean.
+
+    The fixtures are real linked worktrees (`git worktree add`), because the
+    pointer's shape is what the invariant is about: `gitdir:` naming
+    `<common>/worktrees/<name>`, and git reporting that same common dir.
+    """
+
+    def _linked(self, name='linked'):
+        """A real linked worktree: `root/.git` is a file naming the admin dir."""
+        main = self.tmp / f'repo-{name}'
+        subprocess.run(['git', 'init', '-q', str(main)], check=True, capture_output=True)
+        for key, value in (('user.email', 'a@b'), ('user.name', 'a')):
+            subprocess.run(['git', '-C', str(main), 'config', key, value], check=True)
+        (main / 'f').write_text('x', encoding='utf-8')
+        subprocess.run(['git', '-C', str(main), 'add', 'f'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(main), 'commit', '-qm', 'one'], check=True, capture_output=True)
+        root = self.tmp / name
+        subprocess.run(['git', '-C', str(main), 'worktree', 'add', '-q', str(root), '-b', f'wt-{name}'],
+                       check=True, capture_output=True)
+        return root, main / '.git'
+
+    def _context(self, root):
+        ctx = self.context(roots=(root,))
+        # `git` must answer for real — the pointer's shape is what is under test —
+        # while `getfacl` stays a recorded response like everywhere else in this
+        # suite. A real `Runner` would silently ignore `responses`.
+        runner = FakeRunner()
+
+        def exec_with_real_git(argv, input_text, capture):
+            if argv and argv[0] == 'git':
+                return aa.Runner._exec(runner, argv, input_text, capture)
+            return FakeRunner._exec(runner, argv, input_text, capture)
+
+        runner._exec = exec_with_real_git
+        ctx.runner = runner
+        ctx.git = aa.Git(runner, accounts=ctx.accounts, agent_user=AGENT)
+        return ctx
+
+    def test_a_clean_linked_worktree_is_accepted(self):
+        """The baseline: a real `git worktree add` output must not be refused."""
+        root, common = self._linked()
+        ctx = self._context(root)
+        self.assertEqual(common, aa.Git(ctx.runner, accounts=ctx.accounts,
+                                       agent_user=AGENT).common_dir(root))
+
+    def test_check_fails_a_pointer_owned_by_the_agent(self):
+        """Ownership is the test, and it is the real check's own comparison: the
+        file's owner equals the configured agent's uid."""
+        root, _ = self._linked()
+        ctx = self._context(root)
+        pointer = root / '.git'
+        owner = pointer.stat().st_uid
+        ctx.accounts.users[AGENT] = aa.PasswdEntry(AGENT, owner, 2001, str(self.agent_home), '/bin/bash')
+        checker = aa.Checker(ctx)
+        checker.report = aa.Report()
+        _, out, _ = self.quiet(checker._acls)
+        self.assertIn('FAIL', out)
+        self.assertIn('owned by agent', out)
+
+    def test_check_fails_a_group_writable_pointer(self):
+        root, _ = self._linked()
+        ctx = self._context(root)
+        pointer = root / '.git'
+        pointer.chmod(0o664)
+        checker = aa.Checker(ctx)
+        checker.report = aa.Report()
+        _, out, _ = self.quiet(checker._acls)
+        self.assertIn('FAIL', out)
+        self.assertIn('group/world writable', out)
+
+    def test_check_fails_when_the_pointer_carries_a_write_grant(self):
+        """The recursive root grant covers `.git`; `apply` denies it, `check` must
+        see the denial. A group entry with `w` is the redirected-repo path."""
+        root, _ = self._linked()
+        ctx = self._context(root)
+        pointer = root / '.git'
+        ctx.runner.responses = (
+            (('getfacl', '--absolute-names', str(pointer)), aa.Result(
+                0, f'# file: {pointer}\n# owner: devel\ngroup::rwx\ngroup:agent-dev:rwx\nother::---\n')),
+        )
+        checker = aa.Checker(ctx)
+        checker.report = aa.Report()
+        _, out, _ = self.quiet(checker._acls)
+        self.assertIn('FAIL', out)
+        self.assertIn('can WRITE it', out)
+
+    def test_check_passes_a_pointer_with_no_write_grant(self):
+        root, _ = self._linked()
+        ctx = self._context(root)
+        pointer = root / '.git'
+        ctx.runner.responses = (
+            (('getfacl', '--absolute-names', str(pointer)), aa.Result(
+                0, f'# file: {pointer}\n# owner: devel\ngroup::r--\nmask::r--\nother::r--\n')),
+        )
+        checker = aa.Checker(ctx)
+        checker.report = aa.Report()
+        _, out, _ = self.quiet(checker._acls)
+        self.assertIn('no write grant', out)
+        self.assertIn('not group/world writable', out)
+
+    def test_a_redirected_pointer_is_refused_by_both_apply_and_check(self):
+        """The regression this exists for: the pointer is modified to name a
+        repository the operator did not authorize. `apply` must refuse (it would
+        grant ACLs on the redirected store), and `check` must not grant it."""
+        root, _ = self._linked()
+        hostile = self.tmp / 'hostile-store'
+        (hostile / 'worktrees' / 'linked').mkdir(parents=True)
+        (root / '.git').write_text(f'gitdir: {hostile}/worktrees/linked\n', encoding='utf-8')
+
+        ctx = self._context(root)
+        with self.assertRaises(aa.AgentAccountError):
+            aa.validate_roots(ctx)
+
+        ctx = self._context(root)
+        checker = aa.Checker(ctx)
+        checker.report = aa.Report()
+        _, out, _ = self.quiet(checker._acls)
+        self.assertIn('FAIL', out, 'check certified a redirected git store')
+        for grant in ('objects', 'refs'):
+            self.assertNotIn(f'PASS {self.tmp}/hostile-store/{grant}', out,
+                             'no ACL is reported as granted on the redirected store')
+
+    def test_a_pointer_naming_a_foreign_admin_dir_is_refused(self):
+        """A gitdir that resolves but is outside `<common>/worktrees` — the shape a
+        redirect takes when the target still looks like a worktree admin dir."""
+        root, common = self._linked()
+        other = self.tmp / 'other-store' / 'worktrees' / 'linked'
+        other.mkdir(parents=True)
+        # Make git accept it as this worktree's admin dir, then point elsewhere.
+        (root / '.git').write_text(f'gitdir: {other}\n', encoding='utf-8')
+        with self.assertRaises(aa.AgentAccountError):
+            self._context(root).git.common_dir(root)
+
+    def test_a_symlinked_dot_git_is_refused(self):
+        """A symlink `.git` is the substitution: the path `apply` checked is not the
+        directory git will read."""
+        root, common = self._linked()
+        (root / '.git').unlink()
+        (root / '.git').symlink_to(common)
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            self._context(root).git.common_dir(root)
+        self.assertIn('symlink', str(caught.exception))
 
 
 # ---------------------------------------------------------------------------
@@ -584,16 +813,422 @@ class PlaybookVariablesTest(Base):
         self.assertIn('would snapshot', out)
         self.assertIn('plan only', out)
 
-    def test_the_playbook_is_not_asked_twice_for_the_same_apply(self):
+    def test_apply_runs_identity_phase_before_acl_grants(self):
         ctx = self.context()
         store = aa.StateStore(self.tmp / 'state')
         self.quiet(aa.Provisioner(ctx, store).apply)
-        self.assertEqual(1, len(ctx.ansible.calls))
+        self.assertEqual(2, len(ctx.ansible.calls))
+        self.assertEqual([], ctx.ansible.calls[0]['variables']['agent_acl_grants'])
+        self.assertTrue(ctx.ansible.calls[1]['variables']['agent_acl_grants'])
 
 
 # ---------------------------------------------------------------------------
 # sudoers — the one resource that is not declared
 # ---------------------------------------------------------------------------
+
+
+class PolicyDocumentationTest(unittest.TestCase):
+    """The documented policy and the enforced one are the same list.
+
+    A README naming fewer groups than `PRIVILEGED_GROUPS` reads as a complete policy
+    while the code refuses more; naming more reads as a refusal that never happens.
+    """
+
+    def setUp(self):
+        self.readme = (REPO_ROOT / 'README.md').read_text(encoding='utf-8')
+
+    def test_every_enforced_privileged_group_is_documented(self):
+        section = self.readme[self.readme.index('### Privileged groups'):]
+        section = section[:section.index('\n## ')]
+        for group in aa.PRIVILEGED_GROUPS:
+            with self.subTest(group):
+                self.assertIn(f'`{group}`', section,
+                              f'{group} is enforced but not documented')
+
+    def test_the_nested_git_refusal_is_documented(self):
+        section = self.readme[self.readme.index('### What a worktree root may contain'):]
+        section = section[:section.index('\n### ')]
+        for phrase in ('nested repository', 'submodule', 'linked worktree nested'):
+            with self.subTest(phrase):
+                self.assertIn(phrase, section)
+
+    def test_the_linked_worktree_invariants_are_documented(self):
+        section = self.readme[self.readme.index('### What a worktree root may contain'):]
+        section = section[:section.index('\n### ')]
+        for phrase in ('symlink', 'owned by the agent', 'group/world writable',
+                       '<common>/worktrees'):
+            with self.subTest(phrase):
+                self.assertIn(phrase, section)
+        self.assertIn('check', section, 'the check half of the invariant is documented')
+
+
+class AdoptedHomeTest(Base):
+    """An adopted home is judged by WHERE it is as well as what mode it has.
+
+    `apply` chmods this path and installs `.gradle`/`.android`/`.cache` inside it,
+    so a stale passwd record pointing at `/etc`, `/var/lib` or another user's home
+    makes this tool write into system state or into a stranger's files.
+
+    A MISSING home is deliberately not a problem: a fresh account has none, and
+    `useradd -m` (through the playbook) creates it. That distinction is the whole
+    reason the check exists — refusing a missing path would refuse every first
+    install, and accepting an existing unsafe one is the vulnerability.
+    """
+
+    UNSAFE = {
+        '/etc': 'system path /etc',
+        '/etc/agent': 'system path /etc',
+        '/var/lib': 'system path /var/lib',
+        '/var/lib/agent-account': 'system path /var/lib',
+        '/usr/local/share/agent': 'system path /usr',
+        '/srv/agent': 'system path /srv',
+        '/mnt/data/agent': 'system path /mnt',
+        '/home/another-user': "not the agent's own home",
+        '/home': "not the agent's own home",
+        '/': 'would write the agent',
+    }
+
+    def test_every_unsafe_location_is_refused(self):
+        ctx = self.context()
+        for home, expected in self.UNSAFE.items():
+            with self.subTest(home):
+                problem = ctx.home_problem(home)
+                self.assertTrue(problem, f'{home} was accepted as a home')
+                self.assertIn(expected, problem)
+
+    def test_an_unsafe_location_is_refused_even_when_it_does_not_exist(self):
+        """The refusal is about the PATH, not about what is there yet: a missing
+        `/etc/agent` is still the wrong place for useradd to create a home."""
+        ctx = self.context()
+        for home in self.UNSAFE:
+            with self.subTest(home):
+                self.assertTrue(ctx.home_problem(home), f'{home} was accepted as a missing home')
+
+    def test_a_missing_home_in_a_safe_location_is_allowed(self):
+        """The fresh-account case the playbook relies on."""
+        ctx = self.context()
+        missing = self.tmp / 'not-created-yet'
+        self.assertFalse(missing.exists())
+        self.assertEqual('', ctx.home_problem(str(missing)))
+
+    def test_a_fresh_account_with_a_missing_home_provisions(self):
+        """End of the chain: `apply` must not refuse the host it is meant to set up."""
+        agent_home = self.tmp / 'fresh-agent-home'
+        self.assertFalse(agent_home.exists())
+        ctx = self.context(agent_exists=False, agent_home=str(agent_home))
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'), aa.Result(1, '', 'sudo: unknown user agent')),
+            (('sudo', '--non-interactive', '--user=agent'), aa.Result(1, '', '')),
+        )
+        store = aa.StateStore(self.tmp / 'state')
+        self.quiet(aa.Provisioner(ctx, store).apply)
+        self.assertTrue(ctx.ansible.calls, 'the playbook ran for a fresh account')
+
+    def test_an_adopted_home_in_a_system_path_refuses_before_any_write(self):
+        """Not only a predicate: `apply` itself stops, with the host untouched."""
+        ctx = self.context(agent_home='/var/lib/agent-account')
+        store = aa.StateStore(self.tmp / 'state')
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            self.quiet(aa.Provisioner(ctx, store).apply)
+        self.assertIn('system path', str(caught.exception))
+        self.assertEqual([], ctx.ansible.calls)
+        self.assertFalse((self.tmp / 'sudoers').exists())
+
+    def test_an_adopted_symlinked_home_is_refused(self):
+        real = self.tmp / 'elsewhere'
+        real.mkdir(mode=0o700)
+        link = self.tmp / 'agent-home-link'
+        link.symlink_to(real)
+        problem = self.context().home_problem(str(link))
+        self.assertIn('symlink', problem)
+
+    def test_an_adopted_world_readable_home_is_refused(self):
+        home = self.tmp / 'agent-home-open'
+        home.mkdir()
+        home.chmod(0o755)
+        problem = self.context().home_problem(str(home))
+        self.assertIn('group/world accessible', problem)
+
+    def test_an_adopted_home_owned_by_a_stranger_is_refused(self):
+        """Ownership, not just the mode: a 0700 directory owned by another uid is
+        another identity's state, and `apply` would install into it.
+
+        `home_problem` accepts the CURRENT euid as an owner too (a root-run `apply`
+        sees root-owned homes), so the stranger is simulated by moving the euid
+        away from the directory's real owner rather than by chown.
+        """
+        home = self.tmp / 'agent-home-foreign'
+        home.mkdir(mode=0o700)
+        ctx = self.context()
+        ctx.accounts.users[AGENT] = aa.PasswdEntry(AGENT, home.stat().st_uid + 1, 2001,
+                                                   str(home), '/bin/bash')
+        with mock.patch('os.geteuid', return_value=home.stat().st_uid + 1):
+            problem = ctx.home_problem(str(home))
+        self.assertIn('owned by uid', problem)
+
+    def test_a_missing_home_is_not_reported_as_unreadable(self):
+        """`FileNotFoundError` is the fresh case; any OTHER stat error is a real
+        problem and must not be swallowed into the same empty answer."""
+        ctx = self.context()
+        denied = self.tmp / 'denied-parent' / 'home'
+        (self.tmp / 'denied-parent').mkdir()
+        (self.tmp / 'denied-parent').chmod(0o000)
+        self.addCleanup((self.tmp / 'denied-parent').chmod, 0o700)
+        if os.access(denied, os.F_OK):
+            self.skipTest('running as root: permission denied cannot be provoked')
+        problem = ctx.home_problem(str(denied))
+        self.assertIn('cannot stat', problem)
+
+
+class SudoPreflightTest(Base):
+    """No worktree access is granted before the agent's sudo rights are answered.
+
+    The escalation the change forbids is an `agent` that can become root. Granting
+    the ACLs first and discovering the rule afterwards leaves a window where the
+    agent already holds the worktree; `apply` splits the playbook so the identity
+    phase lands first, the audit runs, and only then are the ACLs granted.
+
+    Every rule SHAPE is tested, not only `NOPASSWD`: a password-required,
+    command-scoped, runas-scoped or group rule is the same escalation — the account
+    can still leave itself — and matching on the word NOPASSWD would read it clean.
+    """
+
+    #: The rule lines `sudo -l` prints under "may run the following commands".
+    RULE_SHAPES = {
+        'direct NOPASSWD': '    (ALL) NOPASSWD: ALL',
+        'password required': '    (ALL) ALL',
+        'command scoped': '    (root) /usr/bin/apt update',
+        'runas scoped': '    (postgres) NOPASSWD: /usr/bin/psql',
+        'included after another': '    (root) /bin/ls\n    (ALL) ALL',
+        'group-wide': '    (ALL) NOPASSWD: ALL',
+    }
+
+    def _listing(self, rules: str) -> aa.Result:
+        return aa.Result(0, f'User agent may run the following commands:\n{rules}\n', '')
+
+    def _no_sudo_probe(self) -> tuple:
+        """The behavioural probe answering "the agent cannot sudo"."""
+        return (
+            ('sudo', '--non-interactive', '--list'), aa.Result(1, '', 'sudo: a password is required'),
+        )
+
+    def test_every_rule_shape_is_parsed_as_a_rule(self):
+        for label, rules in self.RULE_SHAPES.items():
+            with self.subTest(label):
+                listing = self._listing(rules)
+                parsed = aa.parse_sudo_rules(listing.out)
+                self.assertTrue(parsed, f'{label} read as a clean account: {listing.out!r}')
+
+    def test_every_rule_shape_refuses_the_preflight(self):
+        for label, rules in self.RULE_SHAPES.items():
+            with self.subTest(label):
+                ctx = self.context()
+                ctx.runner.responses = ((('sudo', '--non-interactive', '--list'), self._listing(rules)),)
+                provisioner = aa.Provisioner(ctx, aa.StateStore(self.tmp / 'state'))
+                with self.assertRaises(aa.AgentAccountError) as caught:
+                    provisioner.audit_sudo(preflight=True)
+                self.assertIn('sudo rule', str(caught.exception))
+
+    def test_a_password_required_rule_is_not_read_as_clean(self):
+        """The specific hole a NOPASSWD-matching parser has."""
+        ctx = self.context()
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'), self._listing('    (ALL) ALL')),
+        )
+        provisioner = aa.Provisioner(ctx, aa.StateStore(self.tmp / 'state'))
+        with self.assertRaises(aa.AgentAccountError):
+            provisioner.audit_sudo(preflight=True)
+
+    def test_a_successful_behaviour_probe_refuses_even_without_a_listing(self):
+        """A rule the listing would not show is still a rule."""
+        ctx = self.context()
+
+        def exec_(argv, input_text, capture):
+            if '--list' in argv:
+                return aa.Result(1, '', 'sudo: a password is required')
+            if tuple(argv[-3:]) == ('/usr/bin/sudo', '-n', 'true'):
+                return aa.Result(0, '', '')
+            return aa.Result(1, '', '')
+
+        ctx.runner._exec = exec_
+        provisioner = aa.Provisioner(ctx, aa.StateStore(self.tmp / 'state'))
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            provisioner.audit_sudo(preflight=True)
+        self.assertIn('CAN run sudo', str(caught.exception))
+
+    def test_an_unverifiable_preflight_refuses(self):
+        """Unreadable + unprobeable is not evidence of safety."""
+        ctx = self.context()
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'), aa.Result(1, '', 'sudo: a password is required')),
+            (('sudo', '--non-interactive', '--user=agent'), aa.Result(1, '', '')),
+        )
+        provisioner = aa.Provisioner(ctx, aa.StateStore(self.tmp / 'state'))
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            provisioner.audit_sudo(preflight=True)
+        self.assertIn('cannot be verified', str(caught.exception))
+
+    def test_an_unverifiable_FINAL_audit_is_only_a_warning(self):
+        """Symmetry, deliberately broken: after provisioning there is nothing left to
+        refuse, so the same unreadable answer is a note, not a failure."""
+        ctx = self.context()
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'), aa.Result(1, '', 'sudo: a password is required')),
+            (('sudo', '--non-interactive', '--user=agent'), aa.Result(1, '', '')),
+        )
+        provisioner = aa.Provisioner(ctx, aa.StateStore(self.tmp / 'state'))
+        _, _, err = self.quiet(provisioner.audit_sudo)
+        self.assertIn('unverified', err)
+
+    def test_a_missing_account_predicted_as_present_is_still_audited(self):
+        """`account_expected` is the after-creation call: the account exists by then
+        only if the playbook succeeded, so the answer must still be obtained.
+
+        "unknown user" is a DEFINITIVE answer — nothing to grant — so it is the one
+        unreadable case a preflight may accept instead of refusing.
+        """
+        ctx = self.context(agent_exists=False)
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'), aa.Result(1, '', 'sudo: unknown user agent')),
+            (('sudo', '--non-interactive', '--user=agent'), aa.Result(1, '', '')),
+        )
+        provisioner = aa.Provisioner(ctx, aa.StateStore(self.tmp / 'state'))
+        provisioner.audit_sudo(preflight=True, account_expected=True)
+
+    def test_a_missing_account_without_account_expected_is_not_audited(self):
+        """A fresh host has no account yet; there is nothing to ask about, and asking
+        would refuse every first install."""
+        ctx = self.context(agent_exists=False)
+        provisioner = aa.Provisioner(ctx, aa.StateStore(self.tmp / 'state'))
+        provisioner.audit_sudo(preflight=True)
+        asked = [argv for argv in ctx.runner.executed if argv and argv[0] == 'sudo']
+        self.assertEqual([], asked, 'a fresh host was probed for sudo')
+
+    def test_no_acl_grant_is_declared_before_the_preflight_passes(self):
+        """The ordering, from the plan the playbook is handed: phase 1 carries no
+        ACL grants at all, and phase 2 — the only one that grants worktree access —
+        is never reached when the preflight refuses."""
+        ctx = self.context(roots=(self.wt,))
+        # The adopted account is clean, so the preflight passes and both phases run.
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'), aa.Result(0, 'User agent is not allowed to run sudo\n', '')),
+        )
+        store = aa.StateStore(self.tmp / 'state')
+        self.quiet(aa.Provisioner(ctx, store).apply)
+        self.assertEqual(2, len(ctx.ansible.calls))
+        self.assertEqual([], ctx.ansible.calls[0]['variables']['agent_acl_grants'],
+                         'phase 1 must grant nothing')
+
+    def test_a_failing_preflight_grants_nothing_at_all(self):
+        """The whole point: a host whose agent holds a sudo rule is left untouched —
+        no phase 2, so no worktree grant was ever written."""
+        ctx = self.context(roots=(self.wt,))
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'), self._listing('    (ALL) ALL')),
+        )
+        store = aa.StateStore(self.tmp / 'state')
+        with self.assertRaises(aa.AgentAccountError):
+            self.quiet(aa.Provisioner(ctx, store).apply)
+        self.assertEqual([], ctx.ansible.calls, 'no playbook ran, so no grant was written')
+        writes = [
+            argv for argv in ctx.runner.executed
+            if argv and argv[0] in ('useradd', 'usermod', 'groupadd', 'setfacl')
+        ]
+        self.assertEqual([], writes, 'a refused host was modified')
+
+    def test_the_preflight_runs_before_the_sudoers_rule_is_installed(self):
+        """An adopted account holding a rule must be refused before the tool writes
+        its own rule — a written sudoers file is a change to the host."""
+        ctx = self.context()
+        ctx.runner.responses = (
+            (('sudo', '--non-interactive', '--list'), self._listing('    (ALL) NOPASSWD: ALL')),
+        )
+        store = aa.StateStore(self.tmp / 'state')
+        with self.assertRaises(aa.AgentAccountError):
+            self.quiet(aa.Provisioner(ctx, store).apply)
+        self.assertFalse((self.tmp / 'sudoers').exists(), 'the sudoers rule was written before the audit')
+
+
+class GetfaclFailureTest(Base):
+    """Every `getfacl` call site fails CLOSED.
+
+    There are three, and each once treated "no answer" as "no entry": the mask
+    computation in `acl_grants`, the snapshot that rollback restores from, and the
+    `check` reader. A missing binary, a permission error and output in an
+    unexpected shape are all the same question — did we read the ACL — and the only
+    safe answer to "no" is to stop. Certifying a host from output that could not be
+    parsed is how a missing grant reads as a pass.
+    """
+
+    FAILURES = {
+        'missing binary': aa.Result(127, '', 'getfacl: command not found'),
+        'permission denied': aa.Result(1, '', 'getfacl: Permission denied'),
+        'unexpected output': aa.Result(0, 'garbage, not an ACL\n', ''),
+    }
+
+    def _mask_ctx(self):
+        ctx = self.context()
+        return ctx
+
+    def test_the_mask_computation_refuses_every_failure(self):
+        """`acl_grants` also reads the existing ACL to preserve the mask."""
+        for label, result in self.FAILURES.items():
+            with self.subTest(label):
+                ctx = self._mask_ctx()
+                ctx.runner.responses = ((('getfacl',), result),)
+                with self.assertRaises(aa.AgentAccountError) as caught:
+                    aa.acl_grants(ctx.cfg, ctx, str(self.agent_home))
+                self.assertIn('refusing to compute mask changes', str(caught.exception))
+
+    def test_the_snapshot_refuses_every_failure(self):
+        """A snapshot that could not be read cannot be restored from, and a partial
+        one would make `rollback` reintroduce a grant."""
+        for label, result in self.FAILURES.items():
+            with self.subTest(label):
+                ctx = self.context(roots=(self.wt,))
+                ctx.runner.responses = ((('getfacl',), result),)
+                store = aa.StateStore(self.tmp / 'state')
+                with self.assertRaises(aa.AgentAccountError) as caught:
+                    self.quiet(aa.Provisioner(ctx, store).apply)
+                self.assertIn('could not snapshot', str(caught.exception))
+
+    def test_check_reports_every_failure_as_a_failure(self):
+        """`check` must not print PASS on a target it could not read."""
+        for label, result in self.FAILURES.items():
+            with self.subTest(label):
+                ctx = self.context(roots=(self.wt,))
+                ctx.runner.responses = ((('getfacl',), result),)
+                checker = aa.Checker(ctx)
+                checker.report = aa.Report()
+                _, out, _ = self.quiet(checker._acls)
+                self.assertIn('FAIL', out)
+                self.assertIn('cannot read ACLs', out)
+
+    def test_a_valid_empty_answer_is_still_an_answer(self):
+        """The distinction the fix has to keep: output that PARSES but carries no
+        named entry is a real ACL, not a failure."""
+        ctx = self.context(roots=(self.wt,))
+        ctx.runner.responses = (
+            (('getfacl', '--absolute-names', str(self.wt)),
+             aa.Result(0, f'# file: {self.wt}\nuser::rwx\ngroup::r-x\nother::---\n')),
+        )
+        checker = aa.Checker(ctx)
+        checker.report = aa.Report()
+        _, out, _ = self.quiet(checker._acls)
+        self.assertNotIn('cannot read ACLs', out)
+
+    def test_the_snapshot_accepts_a_real_recursive_dump(self):
+        """`# file:` headed output is what `--recursive` prints, and it must not be
+        mistaken for garbage."""
+        ctx = self.context(roots=(self.wt,))
+        ctx.runner.responses = (
+            (('getfacl',),
+             aa.Result(0, f'# file: {self.wt}\nuser::rwx\ngroup::r-x\nother::---\n'
+                          f'\n# file: {self.wt}/sub\nuser::rwx\ngroup::r-x\nother::---\n')),
+        )
+        store = aa.StateStore(self.tmp / 'state')
+        self.quiet(aa.Provisioner(ctx, store).apply)
+        self.assertTrue(store.path.exists(), 'the apply recorded its snapshot')
 
 
 class SudoersTest(Base):
@@ -602,6 +1237,30 @@ class SudoersTest(Base):
         if text is not None:
             path.write_text(text, encoding='utf-8')
         return path
+
+    def test_symlink_sudoers_is_refused(self):
+        ctx = self.context()
+        target = self.tmp / 'real-sudoers'
+        target.write_text(ctx.cfg.sudoers_rule, encoding='utf-8')
+        link = self.tmp / 'sudoers-link'
+        link.symlink_to(target)
+        ctx.cfg = ctx.cfg.model_copy(update={'sudoers_path': link})
+        provisioner = aa.Provisioner(ctx, aa.StateStore(self.tmp / 'state'))
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            provisioner._install_sudoers()
+        self.assertIn('symlink', str(caught.exception))
+        self.assertTrue(link.is_symlink())
+
+    def test_dangling_symlink_sudoers_is_refused(self):
+        ctx = self.context()
+        link = self.tmp / 'sudoers-dangling'
+        link.symlink_to(self.tmp / 'missing')
+        ctx.cfg = ctx.cfg.model_copy(update={'sudoers_path': link})
+        provisioner = aa.Provisioner(ctx, aa.StateStore(self.tmp / 'state'))
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            provisioner._install_sudoers()
+        self.assertIn('symlink', str(caught.exception))
+        self.assertTrue(link.is_symlink())
 
     def _provisioner(self, path):
         ctx = self.context()
@@ -619,6 +1278,20 @@ class SudoersTest(Base):
             provisioner._install_sudoers()
         self.assertIn('this script did not write', str(caught.exception))
         self.assertIn('ALL=(ALL)', path.read_text(), 'the other rule must survive')
+
+    def test_a_symlink_pointing_at_valid_rule_is_refused(self):
+        ctx = self.context()
+        target = self.tmp / 'real'
+        target.write_text(ctx.cfg.sudoers_rule, encoding='utf-8')
+        link = self.tmp / 'sudoers-link'
+        link.symlink_to(target)
+        ctx.cfg = ctx.cfg.model_copy(update={'sudoers_path': link})
+        provisioner = aa.Provisioner(ctx, aa.StateStore(self.tmp / 'state'))
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            provisioner._install_sudoers()
+        self.assertIn('symlink', str(caught.exception))
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(ctx.cfg.sudoers_rule, target.read_text(encoding='utf-8').strip())
 
     def test_a_matching_file_is_adopted_not_owned(self):
         ctx = self.context()
@@ -758,6 +1431,14 @@ class SnapshotTest(Base):
             self.quiet(aa.Provisioner(ctx, store).apply)
         self.assertIn('could not snapshot', str(caught.exception))
 
+    def test_a_partial_or_unexpected_getfacl_output_stops_the_run(self):
+        ctx = self.context(roots=(self.wt,))
+        ctx.runner.responses = ((('getfacl',), aa.Result(0, 'garbage\n', '')),)
+        store = aa.StateStore(self.tmp / 'state')
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            self.quiet(aa.Provisioner(ctx, store).apply)
+        self.assertIn('could not snapshot', str(caught.exception))
+
 
 # ---------------------------------------------------------------------------
 # ACL parsing and effective permissions
@@ -771,6 +1452,28 @@ class AclParsingTest(unittest.TestCase):
         named = [e for e in entries if e.named]
         self.assertEqual(1, len(named))
         self.assertEqual(('group', SEAM, 'r-x'), (named[0].tag, named[0].qualifier, named[0].perms))
+
+    def test_acl_grants_fail_closed_on_getfacl_error(self):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix='aa-acl-'))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        home = tmp / 'home'
+        (home / 'Android/Sdk').mkdir(parents=True)
+        ctx = make_context(dev_home=home, agent_home=str(tmp / 'agent'), sdk_dir_rel='Android/Sdk', toolchain_rels=(), roots=())
+        ctx.runner.responses = ((('getfacl',), aa.Result(1, '', 'permission denied')),)
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            aa.acl_grants(ctx.cfg, ctx, str(tmp / 'agent'))
+        self.assertIn('cannot read ACLs', str(caught.exception))
+
+    def test_acl_grants_fail_closed_on_unexpected_output(self):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix='aa-acl-'))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        home = tmp / 'home'
+        (home / 'Android/Sdk').mkdir(parents=True)
+        ctx = make_context(dev_home=home, agent_home=str(tmp / 'agent'), sdk_dir_rel='Android/Sdk', toolchain_rels=(), roots=())
+        ctx.runner.responses = ((('getfacl',), aa.Result(0, 'garbage', '')),)
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            aa.acl_grants(ctx.cfg, ctx, str(tmp / 'agent'))
+        self.assertIn('unexpected output', str(caught.exception))
 
     def test_an_effective_qualifier_is_read(self):
         entries = aa.parse_getfacl('group:agent-dev:rwx\t#effective:r-x\n')
@@ -1403,7 +2106,7 @@ class RunBoundaryTest(Base):
         self.assertIn('docker', str(caught.exception))
 
     def test_each_privileged_group_is_refused(self):
-        for group in ('wheel', 'docker', 'kvm'):
+        for group in aa.PRIVILEGED_GROUPS:
             ctx = self.context()
             ctx.accounts.groups[group] = aa.GroupEntry(group, 4000, (AGENT,))
             with self.assertRaises(aa.AgentAccountError, msg=group):
@@ -2224,6 +2927,140 @@ class AnsibleIsolationTest(unittest.TestCase):
                         instance.run({'x': 1})
         self.assertEqual('run failed', str(caught.exception))
         self.assertIn('warning: could not remove temporary files', stderr.getvalue())
+
+
+class TrustedTempParentTest(unittest.TestCase):
+    """The privileged temp parent must not be reachable through the caller's TMPDIR.
+
+    `apply` writes the generated `ansible.cfg` and the `-e @vars.json` file into a
+    temp directory before running the playbook as root. If that directory is inside
+    an inherited `TMPDIR` the caller chose — or inside a world-writable one — the
+    caller can substitute the file between the write and the playbook reading it,
+    and then root loads a config or variables document of the caller's choosing.
+
+    Non-root (which is how these tests run) has no root-owned `/var/lib`, so the
+    contract is: an explicit override must be OWNED BY THE CALLER, otherwise a
+    caller-owned 0700 directory is used, and an inherited TMPDIR never decides it.
+    """
+
+    def setUp(self):
+        saved = {k: os.environ.get(k) for k in
+                 ('AGENT_ISOLATION_TRUSTED_TMP', 'TMPDIR', 'XDG_RUNTIME_DIR')}
+        self.addCleanup(self._restore, saved)
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix='aa-trusted-tmp-'))
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    @staticmethod
+    def _restore(saved):
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_an_inherited_tmpdir_does_not_decide_the_parent(self):
+        hostile = self.root / 'hostile'
+        hostile.mkdir()
+        hostile.chmod(0o777)
+        os.environ.pop('AGENT_ISOLATION_TRUSTED_TMP', None)
+        os.environ['TMPDIR'] = str(hostile)
+        parent = aa.trusted_tmp_parent()
+        self.assertFalse(
+            str(parent).startswith(str(hostile)),
+            f'the privileged temp parent was taken from the caller TMPDIR: {parent}',
+        )
+        self.assertEqual([], list(hostile.iterdir()), 'nothing was created in the hostile TMPDIR')
+
+    def test_the_parent_is_0700_and_not_group_or_world_accessible(self):
+        override = self.root / 'override'
+        os.environ['AGENT_ISOLATION_TRUSTED_TMP'] = str(override)
+        parent = aa.trusted_tmp_parent()
+        self.assertEqual(0o700, parent.stat().st_mode & 0o777)
+        self.assertFalse(parent.is_symlink())
+
+    def test_a_symlinked_override_is_refused(self):
+        """A symlink is the substitution in its purest form: the path the caller
+        named is not the directory the files land in."""
+        real = self.root / 'real'
+        real.mkdir(mode=0o700)
+        link = self.root / 'link'
+        link.symlink_to(real)
+        os.environ['AGENT_ISOLATION_TRUSTED_TMP'] = str(link)
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            aa.trusted_tmp_parent()
+        self.assertIn('not a directory', str(caught.exception))
+
+    def test_a_foreign_owned_override_is_refused(self):
+        """The override must be the caller's own; root would otherwise stage inside
+        a tree somebody else controls. A test cannot chown, so the ownership test is
+        driven through the reported uid instead."""
+        override = self.root / 'foreign'
+        override.mkdir(mode=0o700)
+        os.environ['AGENT_ISOLATION_TRUSTED_TMP'] = str(override)
+        with mock.patch('os.geteuid', return_value=override.stat().st_uid + 1):
+            with self.assertRaises(aa.AgentAccountError) as caught:
+                aa.trusted_tmp_parent()
+        self.assertIn('owned by uid', str(caught.exception))
+
+    def test_a_group_accessible_override_is_refused(self):
+        override = self.root / 'open'
+        override.mkdir()
+        override.chmod(0o750)
+        os.environ['AGENT_ISOLATION_TRUSTED_TMP'] = str(override)
+        with self.assertRaises(aa.AgentAccountError) as caught:
+            aa.trusted_tmp_parent()
+        self.assertIn('group/world accessible', str(caught.exception))
+
+    def test_the_ansible_config_lands_in_the_trusted_parent_not_the_caller_tempdir(self):
+        """End of the chain: the config's DIRECTORY is the trusted one."""
+        hostile = self.root / 'caller-tmp'
+        hostile.mkdir()
+        hostile.chmod(0o777)
+        os.environ['AGENT_ISOLATION_TRUSTED_TMP'] = str(self.root / 'trusted')
+        cfg = aa.Config(dev_name=DEV, dev_home=pathlib.Path('/home/x'))
+        runner = aa.Runner(dry_run=True, environ={'TMPDIR': str(hostile)})
+        instance = aa.Ansible(cfg, runner)
+        self.addCleanup(instance._configs.clear)
+        self.addCleanup(lambda: [shutil.rmtree(p, ignore_errors=True) for p in list(instance._tempdirs)])
+        env = instance._environment()
+        config = pathlib.Path(env['ANSIBLE_CONFIG'])
+        self.assertFalse(str(config).startswith(str(hostile)))
+        self.assertTrue(str(config).startswith(str(self.root / 'trusted')),
+                        f'the config was written outside the trusted parent: {config}')
+        self.assertEqual(0o600, config.stat().st_mode & 0o777)
+
+    def test_the_vars_file_is_written_into_the_trusted_parent(self):
+        """The vars file is read by the privileged playbook too, so it is the same
+        substitution: `-e @vars.json` with a hook that runs as root."""
+        hostile = self.root / 'caller-tmp'
+        hostile.mkdir()
+        hostile.chmod(0o777)
+        os.environ['AGENT_ISOLATION_TRUSTED_TMP'] = str(self.root / 'trusted')
+        cfg = aa.Config(dev_name=DEV, dev_home=pathlib.Path('/home/x'))
+        runner = aa.Runner(dry_run=True, environ={'TMPDIR': str(hostile)})
+        instance = aa.Ansible(cfg, runner)
+        self.addCleanup(instance._configs.clear)
+        self.addCleanup(lambda: [shutil.rmtree(p, ignore_errors=True) for p in list(instance._tempdirs)])
+        seen = {}
+
+        def fake_run(argv, env=None, cwd=None, **kwargs):
+            seen['argv'] = argv
+            seen['env'] = env
+            seen['cwd'] = cwd
+            vars_arg = next(a for a in argv if a.startswith('@'))
+            seen['vars_path'] = vars_arg[1:]
+            seen['vars_dir'] = pathlib.Path(seen['vars_path']).parent
+            seen['vars_text'] = pathlib.Path(seen['vars_path']).read_text(encoding='utf-8')
+            return subprocess.CompletedProcess(args=argv, returncode=0)
+
+        with mock.patch('subprocess.run', side_effect=fake_run):
+            instance.run({'agent_user': DEV})
+        self.assertFalse(str(seen['vars_dir']).startswith(str(hostile)),
+                         f'the vars file was written into the caller TMPDIR: {seen["vars_path"]}')
+        self.assertIn('agent_user', seen['vars_text'])
+        # And the playbook's cwd is that same trusted directory, never the caller's.
+        self.assertEqual(str(seen['vars_dir']), seen['cwd'],
+                         './ansible.cfg is resolved from the cwd, so the cwd must be ours')
 
 
 class AnsibleResolutionTest(unittest.TestCase):

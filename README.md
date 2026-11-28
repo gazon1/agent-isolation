@@ -29,6 +29,42 @@ The agent cannot write Git config or hooks: `.git/config` and `.git/hooks` are e
 denied, and the grant is on the common Git directory (which a linked worktree does not
 carry) so commits still work.
 
+### What a worktree root may contain
+
+The grant on an authorized root is **recursive**, so every `.git` metadata directory
+inside it is reached. That is safe only for the root's own repository, which is
+provisioned deliberately. Two layouts are therefore refused outright, before the first
+write:
+
+| Layout | Why it is refused |
+|---|---|
+| a nested repository (`vendor/lib/.git`) | its `.git/config` and `.git/hooks` would be writable through the outer recursive grant. Writing `config` picks `core.hooksPath`; writing `hooks/` provides a program git runs as the developer |
+| a submodule (`.git` is a file naming `../.git/modules/<name>`) | same, and the target is inside the shared store |
+
+Authorize a root that contains no nested repositories, or remove them. Per-nested-repo
+protection is not implemented; refusing is the honest answer until it is.
+
+A **linked worktree nested inside** an authorized root is refused for the same reason.
+Authorize the linked worktree itself instead — that is the supported layout, and it works:
+its `.git` is a pointer file, and the invariant is that the pointer names
+`<common>/worktrees/<name>` while git reports `<common>` as the common dir. `apply`
+refuses a pointer that is a symlink, is owned by the agent, is group/world writable, or
+resolves outside `<common>/worktrees`; it also denies ACL entries on the pointer. `check`
+verifies the same four properties, so a pointer edited after provisioning to name a
+repository the operator did not authorize is reported as a failure rather than certified.
+
+### Privileged groups
+
+`wheel`, `docker`, `kvm`, `disk`, `lxd` and `incus-admin` are refused, in the primary and
+in the supplementary list, and `apply` reconciles an adopted account out of them. The
+policy is **membership of a root-equivalent capability**, not a fixed distro list: `docker`
+alone defeats every file permission, `disk` exposes block devices, and `lxd`/`incus-admin`
+reach container-root paths. The list is deliberately the same on every distribution;
+groups that exist only on some (`sudo` on Debian, `adm`, `systemd-journal`) are not
+treated as privileged, because they grant log or sudo *reading* rather than an
+unmediated path to root. A group whose installer makes it root-equivalent on your
+distribution and is not listed here is a gap to report, not something `check` will guess.
+
 ## Install
 
 Prerequisites: a Linux host with ACL support, `sudo`, and [`uv`](https://docs.astral.sh/uv/).
@@ -189,7 +225,7 @@ worktree grants and the sudoers rule alone.
 ## Development
 
 ```console
-$ python3 -m unittest discover -s tests -p 'test_agent_account.py'
+$ python3 -m unittest discover -s tests
 ```
 
 The suite runs **against `src/`**, not the installed copy, and needs no root: the seams
