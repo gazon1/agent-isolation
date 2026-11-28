@@ -454,27 +454,31 @@ class TrustedPathTest(unittest.TestCase):
         )
 
 
-def _extract_restore() -> str:
-    """The `restore` function, verbatim, out of `install.sh`."""
+def _extract_cleanup() -> str:
+    """The `cleanup` function, verbatim, out of `install.sh`."""
     text = INSTALL_SH.read_text(encoding='utf-8')
-    start = text.index('restore() {')
-    end = text.index("trap 'restore' EXIT INT TERM", start)
+    start = text.index('cleanup() {')
+    end = text.index("trap 'cleanup' EXIT INT TERM", start)
     return text[start:end]
 
 
 class RestoreBehaviorTest(unittest.TestCase):
-    """Restore must not destroy the only recoverable backup."""
+    """Restore must not destroy the only recoverable backup; normal paths clean WORK."""
 
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix='aa-restore-'))
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.fn = _extract_restore()
+        self.fn = _extract_cleanup()
 
-    def _run(self, *, fail_mv: bool, backup_exists: bool) -> subprocess.CompletedProcess:
+    def _run(self, *, fail_mv: bool, backup_exists: bool,
+             committed: bool = False) -> subprocess.CompletedProcess:
         lib = self.tmp / 'lib'
         stage = self.tmp / 'stage'
+        work = self.tmp / 'work'
         backup = stage / 'previous'
         stage.mkdir()
+        work.mkdir()
+        (work / 'wheel.whl').write_text('built', encoding='utf-8')
         lib.mkdir()
         (lib / 'partial').write_text('new', encoding='utf-8')
         if backup_exists:
@@ -492,10 +496,12 @@ class RestoreBehaviorTest(unittest.TestCase):
             set -eu
             LIB={lib}
             STAGE={stage}
+            WORK={work}
             BACKUP={backup if backup_exists else ''}
-            COMMITTED=no
+            COMMITTED={'yes' if committed else 'no'}
+            CLEANUP_STATUS=0
             {self.fn}
-            trap 'restore' EXIT
+            trap 'cleanup' EXIT
             exit 1
             """)
         return subprocess.run(['sh', '-c', script], capture_output=True, text=True,
@@ -507,6 +513,7 @@ class RestoreBehaviorTest(unittest.TestCase):
         backup = self.tmp / 'stage' / 'previous'
         self.assertTrue((backup / 'old').is_file(), 'backup was destroyed')
         self.assertTrue((self.tmp / 'stage').is_dir(), 'stage containing backup was deleted')
+        self.assertFalse((self.tmp / 'work').exists(), 'work left behind on failed restore')
         self.assertIn('staging directory preserved', result.stderr)
 
     def test_failed_first_install_removes_partial_tree(self):
@@ -514,6 +521,13 @@ class RestoreBehaviorTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertFalse((self.tmp / 'lib').exists(), 'partial install left behind')
         self.assertFalse((self.tmp / 'stage').exists(), 'stage left behind')
+        self.assertFalse((self.tmp / 'work').exists(), 'work left behind on normal failure')
+
+    def test_successful_commit_removes_work_and_stage(self):
+        result = self._run(fail_mv=False, backup_exists=True, committed=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse((self.tmp / 'stage').exists(), 'stage left behind on commit')
+        self.assertFalse((self.tmp / 'work').exists(), 'work left behind on commit')
 
 
 class TransactionTest(unittest.TestCase):
@@ -528,8 +542,8 @@ class TransactionTest(unittest.TestCase):
         install = self.text.index('UV_TOOL_DIR="$LIB" UV_TOOL_BIN_DIR="$LIB/bin-dir" "$UV" tool install')
         self.assertLess(backup, install, 'the backup exists before the tree changes')
 
-    def test_a_restore_trap_covers_every_failure_path(self):
-        self.assertIn('trap \'restore\' EXIT INT TERM', self.text)
+    def test_a_cleanup_trap_covers_every_failure_path(self):
+        self.assertIn("trap 'cleanup' EXIT INT TERM", self.text)
 
     def test_each_install_step_fails_loudly_and_stops(self):
         for message in (
@@ -556,15 +570,21 @@ class TransactionTest(unittest.TestCase):
     def test_failed_restore_preserves_the_only_backup(self):
         """A backup that cannot be restored must not be deleted by the trap."""
         restore_else = self.text.index('COULD NOT ROLL BACK; the previous tree is at $BACKUP')
-        else_block = self.text[restore_else:self.text.index('rm -rf "$STAGE"', restore_else)]
+        else_block = self.text[restore_else:self.text.index('rm -rf -- "$WORK"', restore_else)]
         self.assertNotIn('BACKUP=""', else_block)
         self.assertIn('staging directory preserved at $STAGE', else_block)
+        self.assertNotIn('rm -rf -- "$STAGE"', else_block)
 
     def test_a_failed_first_install_removes_the_partial_tree(self):
         """With no backup, a failed install must not leave a partial root-owned tree."""
-        restore = self.text[self.text.index('restore() {'):self.text.index("trap 'restore'")]
-        self.assertIn('First install or no backup', restore)
-        self.assertIn('rm -rf "$LIB"', restore)
+        cleanup = self.text[self.text.index('cleanup() {'):self.text.index("trap 'cleanup'")]
+        self.assertIn('First install or no backup', cleanup)
+        self.assertIn('rm -rf -- "$LIB"', cleanup)
+        self.assertIn('rm -rf -- "$STAGE" "$WORK"', cleanup)
+
+    def test_work_is_cleaned_on_commit_and_normal_failure(self):
+        cleanup = self.text[self.text.index('cleanup() {'):self.text.index("trap 'cleanup'")]
+        self.assertIn('rm -rf -- "$STAGE" "$WORK"', cleanup)
 
 
 if __name__ == '__main__':

@@ -45,22 +45,38 @@ That installs, **root-owned and outside any project checkout**:
 | `/usr/local/lib/agent-isolation/collections/` | the `ansible.posix` collection the playbook imports |
 | `/usr/local/bin/agent-account` | the CLI, a symlink into that venv |
 
-The install is a **copy**, and it is built **without root**. `install.sh` builds the
-wheel as the invoking user, then root installs that prebuilt artifact with `--no-build`.
-A malicious build backend in the checkout therefore never executes with root privileges —
-measured: a hatch hook planted in `pyproject.toml` runs as the calling user, never as root.
+### Trust boundary and privileges
 
-Post-install verification also runs as the invoking user, not root, so code from the
-installed artifact is not executed with root privileges during installation.
+`sudo ./install.sh` executes `install.sh` itself as root. The checkout, including
+`install.sh`, and the build environment must be trusted. A checkout writable by an
+untrusted agent can replace `install.sh` and gain root execution. Do not run it from an
+untrusted checkout. This installer builds the wheel from that checkout; it does **not**
+currently accept or verify a separately supplied trusted wheel artifact, and a checksum
+verified by code in the same untrusted checkout is not a trust boundary.
+
+What runs as which identity:
+
+| Step | Runs as | Purpose |
+|---|---|---|
+| `uv build --wheel` | invoking user (`$SUDO_USER`) | build wheel from checkout without root build hooks |
+| `uv export` constraints | invoking user (`$SUDO_USER`) | export committed lock as install constraints |
+| Path/trust checks, staging, `uv tool install --no-build`, symlink, `chown`/`chmod`, install rollback | root | trusted filesystem and package placement into the install prefix |
+| `ansible-galaxy collection install` | invoking user (`$SUDO_USER`) | install collections without executing artifact code as root |
+| Post-install `python -I -c ...` / `ansible-playbook --version` checks | invoking user (`$SUDO_USER`) | verify installed artifact without executing it as root |
+
+The installer resets `PATH` to a known-safe value before privileged operations and resolves
+`uv` from that PATH. It refuses install roots whose existing path components are not
+root-owned or are group/world-writable. For paths that do not exist yet, it validates the
+nearest existing ancestor before creating directories.
+
+**Artifact trust boundary:** the wheel is built from the trusted checkout by the invoking
+user, so the checkout can influence the installed artifact. Root does not execute build
+hooks or artifact verification/collection-install code during installation, but a
+compromised wheel is still a compromised install. Treat the checkout, including
+`install.sh`, and the build environment as part of the trusted computing base.
 
 The checkout is never linked into what root executes. Delete or modify it afterwards and
 `apply` still runs the same installed code.
-
-**Artifact trust boundary:** the wheel is built from the checkout by the invoking user, so
-the checkout can influence the installed artifact. Root does not execute that artifact
-during installation, but a compromised wheel is still a compromised install. Install from a
-trusted, independently verified wheel, or treat the checkout and build environment as part
-of the trusted computing base.
 
 Verify the layout without touching the host:
 
@@ -71,7 +87,7 @@ $ agent-account --help
 
 ### Upgrade
 
-Re-run the installer from a newer checkout:
+Re-run the installer from a newer trusted checkout:
 
 ```console
 $ sudo ./install.sh
@@ -80,6 +96,27 @@ $ sudo ./install.sh
 It replaces the venv in place and reinstalls the collections at their pinned version.
 The account, its ACLs and the journal are untouched — an upgrade is not a reprovision.
 Confirm with `agent-account check`.
+
+### Install failures and manual recovery
+
+The installer keeps the previous install in a staging backup before replacing `$LIB`.
+On a normal install/upgrade failure, it restores the previous install when a backup exists.
+On a first install with no backup, it removes the partial `$LIB` instead of leaving a
+half-installed root-owned tree.
+
+If rollback itself fails, the installer does **not** delete the backup or staging
+directory. It prints the surviving backup path and preserved staging directory path; leave
+them in place and recover manually before retrying. A typical recovery is to inspect those
+paths, then move the preserved backup back to the install prefix as root:
+
+```console
+# paths are printed by install.sh on failure; inspect before moving
+sudo rm -rf /usr/local/lib/agent-isolation
+sudo mv <printed-backup-path> /usr/local/lib/agent-isolation
+```
+
+After manual recovery, re-run `agent-account --help` or `agent-account check` as
+appropriate, then retry the install from a trusted checkout.
 
 ### Rollback of the install (not the account)
 

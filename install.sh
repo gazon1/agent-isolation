@@ -171,26 +171,61 @@ install -d -m 0755 -o root -g root "$LIB"
 # PREBUILT WHEEL with `--no-build`: no build backend, no setup.py, no hatch hook
 # from the checkout is executed with root privileges.
 #
-# Trust boundary: the wheel is built from the checkout by the invoking user, so
-# the checkout influences the installed artifact. Root never executes code from
-# that artifact during installation: build and post-install verification run as
-# the invoking user. Install from a trusted, independently verified wheel if the
-# checkout is not part of the trusted computing base.
+# Trust boundary: `sudo ./install.sh` executes this script as root, so the
+# checkout (including this file) and the build environment must be trusted. A
+# writable checkout can replace this script and gain root execution. The wheel
+# is built from that trusted checkout by the invoking user; root does not
+# execute build hooks or artifact code during installation, but a compromised
+# wheel is still a compromised install. This installer does not accept or verify
+# a separately supplied wheel artifact, and a checksum verified by code in the
+# same untrusted checkout is not a trust boundary.
 if [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ]; then
     echo "install.sh: run this through sudo, so the build runs as you and not as root" >&2
     echo "            (sudo ./install.sh)" >&2
     exit 1
 fi
 BUILD_USER=${SUDO_USER:-$(id -un)}
+BUILD_GROUP=$(id -gn "$BUILD_USER")
 
 # The builder runs as the CALLER and must be able to write its output here, so the
 # directory is owned by that user. `mktemp -d` alone is 0700 root, which made the
 # build fail with a bare "failed" — measured.
 WORK=$(mktemp -d)
-chown "$BUILD_USER" "$WORK"
+chown "$BUILD_USER:$BUILD_GROUP" "$WORK"
 chmod 0755 "$WORK"
+STAGE=""
+BACKUP=""
+COMMITTED=no
+CLEANUP_STATUS=0
+
+cleanup() {
+    CLEANUP_STATUS=$?
+    set +e
+    if [ "$COMMITTED" = yes ]; then
+        rm -rf -- "$STAGE" "$WORK"
+        exit "$CLEANUP_STATUS"
+    fi
+    if [ -n "$BACKUP" ] && [ -d "$BACKUP" ]; then
+        rm -rf -- "$LIB"
+        if mv -- "$BACKUP" "$LIB"; then
+            echo "install.sh: rolled back to the previous installation" >&2
+            BACKUP=""
+            rm -rf -- "$STAGE" "$WORK"
+        else
+            echo "install.sh: COULD NOT ROLL BACK; the previous tree is at $BACKUP" >&2
+            echo "install.sh: staging directory preserved at $STAGE" >&2
+            rm -rf -- "$WORK"
+        fi
+    else
+        # First install or no backup: remove the partial install rather than
+        # leaving a half-installed root-owned tree behind.
+        rm -rf -- "$LIB"
+        rm -rf -- "$STAGE" "$WORK"
+    fi
+    exit "$CLEANUP_STATUS"
+}
 # shellcheck disable=SC2064
-trap "rm -rf '$WORK'" EXIT INT TERM
+trap 'cleanup' EXIT INT TERM
 
 echo "Building the wheel as $BUILD_USER (no root code execution) ..."
 # `runuser` first: it does not prompt (we are root) and it preserves the
@@ -242,7 +277,9 @@ fi
 # Installing into `$LIB` in place leaves the machine with a half-upgraded tree if
 # `ansible-galaxy` or a verification step fails: new code, no collections, or a venv
 # whose imports no longer resolve. The invariant established here: a failed upgrade
-# leaves the PREVIOUS, WORKING install in place.
+# leaves the PREVIOUS, WORKING install in place. `$WORK` is removed on normal exit;
+# `$STAGE` is removed on commit/successful rollback/first-install cleanup, but kept
+# when rollback cannot restore the backup so the only recoverable copy survives.
 #
 # The obvious design — assemble in a staging directory and `mv` it into place — does
 # NOT work for a Python venv, and that was measured rather than assumed: every
@@ -253,34 +290,6 @@ fi
 # the whole class.
 STAGE=$(mktemp -d)
 chmod 0755 "$STAGE"
-BACKUP=""
-COMMITTED=no
-
-restore() {
-    status=$?
-    if [ "$COMMITTED" = yes ]; then
-        rm -rf "$STAGE"
-        exit "$status"
-    fi
-    if [ -n "$BACKUP" ] && [ -d "$BACKUP" ]; then
-        rm -rf "$LIB"
-        if mv "$BACKUP" "$LIB"; then
-            echo "install.sh: rolled back to the previous installation" >&2
-            BACKUP=""
-            rm -rf "$STAGE"
-        else
-            echo "install.sh: COULD NOT ROLL BACK; the previous tree is at $BACKUP" >&2
-            echo "install.sh: staging directory preserved at $STAGE" >&2
-        fi
-    else
-        # First install or no backup: remove the partial install rather than
-        # leaving a half-installed root-owned tree behind.
-        rm -rf "$LIB"
-        rm -rf "$STAGE"
-    fi
-    exit "$status"
-}
-trap 'restore' EXIT INT TERM
 
 # Keep the previous tree aside. `$LIB` may not exist on a first install.
 if [ -d "$LIB" ]; then
@@ -302,7 +311,7 @@ ln -sfn "$LIB/bin-dir/agent-account" "$BIN"
 # The installed artifact comes from the invoking user's checkout, so anything
 # that executes it runs as that user in a throwaway HOME, never as root.
 VERIFY_HOME="$STAGE/verify-home"
-install -d -m 0700 -o "$BUILD_USER" -g "$BUILD_USER" "$VERIFY_HOME"
+install -d -m 0700 -o "$BUILD_USER" "$VERIFY_HOME"
 run_as_builder() {
     if runuser -u "$BUILD_USER" -- env HOME="$VERIFY_HOME" "$@"; then
         return 0
@@ -313,7 +322,7 @@ verify_as_builder() { run_as_builder "$@" >/dev/null 2>&1; }
 
 echo "Installing Ansible collections ..."
 COLLECTIONS_STAGE="$STAGE/collections"
-install -d -m 0755 -o "$BUILD_USER" -g "$BUILD_USER" "$COLLECTIONS_STAGE"
+install -d -m 0755 -o "$BUILD_USER" "$COLLECTIONS_STAGE"
 verify_as_builder "$LIB/agent-isolation/bin/ansible-galaxy" collection install \
     -r "$WORK/requirements.yml" -p "$COLLECTIONS_STAGE" --force || {
     echo "install.sh: the collections failed; keeping the previous install" >&2
