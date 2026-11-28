@@ -50,13 +50,17 @@ wheel as the invoking user, then root installs that prebuilt artifact with `--no
 A malicious build backend in the checkout therefore never executes with root privileges —
 measured: a hatch hook planted in `pyproject.toml` runs as the calling user, never as root.
 
+Post-install verification also runs as the invoking user, not root, so code from the
+installed artifact is not executed with root privileges during installation.
+
 The checkout is never linked into what root executes. Delete or modify it afterwards and
 `apply` still runs the same installed code.
 
-What this does **not** fix: the wheel is built from the checkout by the developer's own
-account, so whoever can write the checkout can influence the installed code. That is
-developer-level access, not root. For a fully trusted artifact, build on a trusted machine
-and install that wheel.
+**Artifact trust boundary:** the wheel is built from the checkout by the invoking user, so
+the checkout can influence the installed artifact. Root does not execute that artifact
+during installation, but a compromised wheel is still a compromised install. Install from a
+trusted, independently verified wheel, or treat the checkout and build environment as part
+of the trusted computing base.
 
 Verify the layout without touching the host:
 

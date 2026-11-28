@@ -41,10 +41,20 @@ class AssertTrustedTest(unittest.TestCase):
         self.work = self.tmp / 'work'
         self.work.mkdir()
 
-    def _run(self, *, uid: int, mode: str, target: pathlib.Path) -> subprocess.CompletedProcess:
+    def _run(self, *, uid: int, mode: str, target: pathlib.Path,
+             trusted: tuple[pathlib.Path, ...] = ()) -> subprocess.CompletedProcess:
         """Run the guard with `target` reported as `uid`/`mode`."""
         shim = self.tmp / 'shim'
         shim.mkdir(exist_ok=True)
+        trusted_cases = ''.join(
+            f'''
+                    "{p}")
+                        case "$*" in
+                            *%u*) echo 0; exit 0 ;;
+                            *%a*) echo 755; exit 0 ;;
+                        esac ;;'''
+            for p in trusted
+        )
         (shim / 'stat').write_text(
             textwrap.dedent(f'''\
                 #!/bin/sh
@@ -57,7 +67,7 @@ class AssertTrustedTest(unittest.TestCase):
                         case "$*" in
                             *%u*) echo {uid}; exit 0 ;;
                             *%a*) echo {mode}; exit 0 ;;
-                        esac ;;
+                        esac ;;{trusted_cases}
                 esac
                 exec /usr/bin/stat "$@"
                 '''),
@@ -111,10 +121,41 @@ class AssertTrustedTest(unittest.TestCase):
         self.assertTrue('not root' in result.stderr or 'world-writable' in result.stderr,
                         result.stderr)
 
-    def test_a_missing_directory_is_not_a_refusal(self):
-        """A fresh host has no $LIB yet; creating it is the installer's job."""
-        result = self._run(uid=0, mode='755', target=self.work / 'absent')
+    def test_a_missing_directory_under_a_trusted_ancestor_is_accepted(self):
+        """A fresh host has no $LIB yet; its existing ancestor must be trusted."""
+        trusted = []
+        p = self.work
+        while True:
+            trusted.append(p)
+            if p == p.parent:
+                break
+            p = p.parent
+        result = self._run(uid=0, mode='755', target=self.work / 'absent',
+                           trusted=tuple(trusted))
         self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_a_nonexistent_prefix_under_a_writable_ancestor_is_refused(self):
+        """An absent target must not skip validation of its existing ancestor."""
+        prefix = self.tmp / 'writable'
+        prefix.mkdir()
+        prefix.chmod(0o777)
+        target = prefix / 'new-prefix' / 'lib'
+        result = self._run(uid=0, mode='755', target=target, trusted=(prefix,))
+        self.assertNotEqual(0, result.returncode, 'a writable ancestor was accepted')
+        self.assertTrue('not root' in result.stderr or 'world-writable' in result.stderr,
+                        result.stderr)
+
+    def test_a_partially_existing_prefix_under_a_writable_ancestor_is_refused(self):
+        """A partially created prefix still has an attacker-controlled ancestor."""
+        prefix = self.tmp / 'writable-partial'
+        prefix.mkdir()
+        prefix.chmod(0o777)
+        (prefix / 'new-prefix').mkdir()
+        target = prefix / 'new-prefix' / 'lib'
+        result = self._run(uid=0, mode='755', target=target, trusted=(prefix,))
+        self.assertNotEqual(0, result.returncode, 'a writable ancestor was accepted')
+        self.assertTrue('not root' in result.stderr or 'world-writable' in result.stderr,
+                        result.stderr)
 
 
 class GuardOrderTest(unittest.TestCase):
@@ -228,6 +269,54 @@ class SymlinkGuardTest(unittest.TestCase):
         self.assertIn('stat -L -c "%a" "$check"', text)
 
 
+def _extract_verify_helpers() -> str:
+    text = INSTALL_SH.read_text(encoding='utf-8')
+    start = text.index('VERIFY_HOME="$STAGE/verify-home"')
+    end = text.index('\necho "Installing Ansible collections ..."', start)
+    return text[start:end]
+
+
+class ArtifactTrustBoundaryTest(unittest.TestCase):
+    """Install-time verification must not execute checkout-controlled code as root."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix='aa-verify-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.fn = _extract_verify_helpers()
+
+    def test_malicious_package_is_not_executed_as_root_during_verification(self):
+        stage = self.tmp / 'stage'
+        lib = self.tmp / 'lib' / 'agent-isolation' / 'bin'
+        stage.mkdir()
+        lib.mkdir(parents=True)
+        marker = self.tmp / 'ran-as-root'
+        # A malicious "python" that would record root execution.
+        malicious = lib / 'python'
+        malicious.write_text(
+            '#!/bin/sh\n[ "$(id -u)" -eq 0 ] && echo root > ' + str(marker) + '\nexit 0\n',
+            encoding='utf-8',
+        )
+        malicious.chmod(0o755)
+        shim = self.tmp / 'shim'
+        shim.mkdir()
+        # runuser just runs the command as the current user for this test.
+        (shim / 'runuser').write_text('#!/bin/sh\nshift; shift; shift; exec "$@"\n', encoding='utf-8')
+        (shim / 'runuser').chmod(0o755)
+        env = dict(os.environ, PATH=f'{shim}:{os.environ["PATH"]}')
+        script = textwrap.dedent(f"""\
+            set -eu
+            STAGE={stage}
+            LIB={self.tmp / 'lib'}
+            BUILD_USER=$(id -un)
+            {self.fn}
+            verify_as_builder "$LIB/agent-isolation/bin/python" -I -c 'import agent_isolation'
+            """)
+        result = subprocess.run(['sh', '-c', script], capture_output=True, text=True,
+                                check=False, env=env)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse(marker.exists(), 'artifact code executed as root during verification')
+
+
 class ToolTrustTest(unittest.TestCase):
     """Every binary the installer runs AS ROOT is checked, not just the code."""
 
@@ -247,12 +336,26 @@ class ToolTrustTest(unittest.TestCase):
         self.assertIn('--python /usr/bin/python3', self.text)
         self.assertNotIn('--python 3.12', self.text)
 
-    def test_the_post_install_probe_uses_the_same_isolation_as_the_tool(self):
-        """The check must exercise what `apply` will actually execute."""
-        probe = "bin/python\" -I -c 'import agent_isolation"
-        self.assertIn(probe, self.text)
-        older = "bin/python\" -E -c 'import agent_isolation"
-        self.assertNotIn(older, self.text)
+    def test_post_install_verification_does_not_execute_artifact_as_root(self):
+        """The installed artifact comes from an untrusted checkout; root must not import it."""
+        self.assertIn('verify_as_builder', self.text)
+        self.assertIn('runuser -u "$BUILD_USER"', self.text)
+        self.assertNotRegex(
+            self.text,
+            r'(?m)^"\$LIB/agent-isolation/bin/python" -I -c \'import agent_isolation\'',
+            'root must not import the installed artifact directly',
+        )
+        self.assertNotRegex(
+            self.text,
+            r'(?m)^"\$LIB/agent-isolation/bin/python" -I -c \'import ansible\'',
+            'root must not import the installed artifact directly',
+        )
+        self.assertNotRegex(
+            self.text,
+            r'(?m)^"\$LIB/agent-isolation/bin/ansible-galaxy" collection install',
+            'ansible-galaxy from the artifact must not run as root',
+        )
+        self.assertIn('ansible-galaxy" collection install', self.text)
 
 
 class DependencyLockTest(unittest.TestCase):
@@ -351,6 +454,68 @@ class TrustedPathTest(unittest.TestCase):
         )
 
 
+def _extract_restore() -> str:
+    """The `restore` function, verbatim, out of `install.sh`."""
+    text = INSTALL_SH.read_text(encoding='utf-8')
+    start = text.index('restore() {')
+    end = text.index("trap 'restore' EXIT INT TERM", start)
+    return text[start:end]
+
+
+class RestoreBehaviorTest(unittest.TestCase):
+    """Restore must not destroy the only recoverable backup."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix='aa-restore-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.fn = _extract_restore()
+
+    def _run(self, *, fail_mv: bool, backup_exists: bool) -> subprocess.CompletedProcess:
+        lib = self.tmp / 'lib'
+        stage = self.tmp / 'stage'
+        backup = stage / 'previous'
+        stage.mkdir()
+        lib.mkdir()
+        (lib / 'partial').write_text('new', encoding='utf-8')
+        if backup_exists:
+            backup.mkdir()
+            (backup / 'old').write_text('old', encoding='utf-8')
+        shim = self.tmp / 'shim'
+        shim.mkdir()
+        real_rm = shutil.which('rm', path='/usr/bin:/bin') or '/bin/rm'
+        os.symlink(real_rm, shim / 'rm')
+        if fail_mv:
+            (shim / 'mv').write_text('#!/bin/sh\nexit 1\n', encoding='utf-8')
+            (shim / 'mv').chmod(0o755)
+        env = dict(os.environ, PATH=f'{shim}:{os.environ["PATH"]}')
+        script = textwrap.dedent(f"""\
+            set -eu
+            LIB={lib}
+            STAGE={stage}
+            BACKUP={backup if backup_exists else ''}
+            COMMITTED=no
+            {self.fn}
+            trap 'restore' EXIT
+            exit 1
+            """)
+        return subprocess.run(['sh', '-c', script], capture_output=True, text=True,
+                              check=False, env=env)
+
+    def test_failed_restore_preserves_backup_and_stage(self):
+        result = self._run(fail_mv=True, backup_exists=True)
+        self.assertNotEqual(0, result.returncode)
+        backup = self.tmp / 'stage' / 'previous'
+        self.assertTrue((backup / 'old').is_file(), 'backup was destroyed')
+        self.assertTrue((self.tmp / 'stage').is_dir(), 'stage containing backup was deleted')
+        self.assertIn('staging directory preserved', result.stderr)
+
+    def test_failed_first_install_removes_partial_tree(self):
+        result = self._run(fail_mv=False, backup_exists=False)
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse((self.tmp / 'lib').exists(), 'partial install left behind')
+        self.assertFalse((self.tmp / 'stage').exists(), 'stage left behind')
+
+
 class TransactionTest(unittest.TestCase):
     """A failed upgrade must leave a working install, whatever failed."""
 
@@ -379,7 +544,7 @@ class TransactionTest(unittest.TestCase):
     def test_a_committed_install_is_not_rolled_back(self):
         """Otherwise a successful install would delete itself on exit."""
         self.assertIn('COMMITTED=yes', self.text)
-        self.assertIn('[ "$COMMITTED" != yes ]', self.text)
+        self.assertIn('[ "$COMMITTED" = yes ]', self.text)
 
     def test_the_staging_swap_is_not_used_for_a_venv(self):
         """Measured: `mv` a venv and every console script's absolute shebang breaks.
@@ -387,6 +552,19 @@ class TransactionTest(unittest.TestCase):
         The install therefore happens at its real path, with a backup/restore.
         """
         self.assertNotIn('mv "$NEW" "$LIB"', self.text)
+
+    def test_failed_restore_preserves_the_only_backup(self):
+        """A backup that cannot be restored must not be deleted by the trap."""
+        restore_else = self.text.index('COULD NOT ROLL BACK; the previous tree is at $BACKUP')
+        else_block = self.text[restore_else:self.text.index('rm -rf "$STAGE"', restore_else)]
+        self.assertNotIn('BACKUP=""', else_block)
+        self.assertIn('staging directory preserved at $STAGE', else_block)
+
+    def test_a_failed_first_install_removes_the_partial_tree(self):
+        """With no backup, a failed install must not leave a partial root-owned tree."""
+        restore = self.text[self.text.index('restore() {'):self.text.index("trap 'restore'")]
+        self.assertIn('First install or no backup', restore)
+        self.assertIn('rm -rf "$LIB"', restore)
 
 
 if __name__ == '__main__':

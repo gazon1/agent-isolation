@@ -89,16 +89,39 @@ assert_trusted() {
         done
     }
     for path in "$@"; do
-        [ -e "$path" ] || continue
-        # The path as given: catches a writable directory holding the entry.
-        _walk "$(case $path in /*) printf %s "$path" ;; *) printf %s "$PWD/$path" ;; esac)"
-        # Its real location: catches a writable ancestor behind a symlink.
-        canonical=$(readlink -f -- "$path")
-        if [ -z "$canonical" ]; then
-            echo "install.sh: cannot canonicalise $path" >&2
-            exit 1
+        case $path in /*) abs=$path ;; *) abs=$PWD/$path ;; esac
+        if [ -e "$abs" ]; then
+            # The path as given: catches a writable directory holding the entry.
+            _walk "$abs"
+            # Its real location: catches a writable ancestor behind a symlink.
+            canonical=$(readlink -f -- "$abs")
+            if [ -z "$canonical" ]; then
+                echo "install.sh: cannot canonicalise $abs" >&2
+                exit 1
+            fi
+            _walk "$canonical"
+        else
+            # The path does not exist yet; the nearest existing ancestor is where
+            # an attacker controls what gets created. Validate that ancestor and
+            # every existing component above it before any directory is made.
+            ancestor=$abs
+            while [ ! -e "$ancestor" ]; do
+                parent=$(dirname -- "$ancestor")
+                [ "$parent" = "$ancestor" ] && break
+                ancestor=$parent
+            done
+            if [ ! -e "$ancestor" ]; then
+                echo "install.sh: no existing ancestor for $abs" >&2
+                exit 1
+            fi
+            _walk "$ancestor"
+            canonical=$(readlink -f -- "$ancestor")
+            if [ -z "$canonical" ]; then
+                echo "install.sh: cannot canonicalise $ancestor" >&2
+                exit 1
+            fi
+            _walk "$canonical"
         fi
-        _walk "$canonical"
     done
 }
 
@@ -148,11 +171,11 @@ install -d -m 0755 -o root -g root "$LIB"
 # PREBUILT WHEEL with `--no-build`: no build backend, no setup.py, no hatch hook
 # from the checkout is executed with root privileges.
 #
-# The residual assumption is stated rather than hidden: the wheel is built from the
-# checkout by the developer's own account, so an agent that can write the checkout
-# can influence the code that gets installed. That is developer-level access, which
-# such an agent already has; it is not root. Do not install from a checkout an
-# agent can write if that matters — build elsewhere and pass the wheel.
+# Trust boundary: the wheel is built from the checkout by the invoking user, so
+# the checkout influences the installed artifact. Root never executes code from
+# that artifact during installation: build and post-install verification run as
+# the invoking user. Install from a trusted, independently verified wheel if the
+# checkout is not part of the trusted computing base.
 if [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ]; then
     echo "install.sh: run this through sudo, so the build runs as you and not as root" >&2
     echo "            (sudo ./install.sh)" >&2
@@ -235,17 +258,27 @@ COMMITTED=no
 
 restore() {
     status=$?
-    if [ "$COMMITTED" != yes ] && [ -n "$BACKUP" ] && [ -d "$BACKUP" ]; then
+    if [ "$COMMITTED" = yes ]; then
+        rm -rf "$STAGE"
+        exit "$status"
+    fi
+    if [ -n "$BACKUP" ] && [ -d "$BACKUP" ]; then
         rm -rf "$LIB"
         if mv "$BACKUP" "$LIB"; then
             echo "install.sh: rolled back to the previous installation" >&2
+            BACKUP=""
+            rm -rf "$STAGE"
         else
             echo "install.sh: COULD NOT ROLL BACK; the previous tree is at $BACKUP" >&2
+            echo "install.sh: staging directory preserved at $STAGE" >&2
         fi
-        BACKUP=""
+    else
+        # First install or no backup: remove the partial install rather than
+        # leaving a half-installed root-owned tree behind.
+        rm -rf "$LIB"
+        rm -rf "$STAGE"
     fi
-    rm -rf "$STAGE"
-    exit $status
+    exit "$status"
 }
 trap 'restore' EXIT INT TERM
 
@@ -266,25 +299,41 @@ UV_TOOL_DIR="$LIB" UV_TOOL_BIN_DIR="$LIB/bin-dir" "$UV" tool install \
     "$WHEEL"
 ln -sfn "$LIB/bin-dir/agent-account" "$BIN"
 
+# The installed artifact comes from the invoking user's checkout, so anything
+# that executes it runs as that user in a throwaway HOME, never as root.
+VERIFY_HOME="$STAGE/verify-home"
+install -d -m 0700 -o "$BUILD_USER" -g "$BUILD_USER" "$VERIFY_HOME"
+run_as_builder() {
+    if runuser -u "$BUILD_USER" -- env HOME="$VERIFY_HOME" "$@"; then
+        return 0
+    fi
+    su -s /bin/sh "$BUILD_USER" -c "HOME=$(printf %s "$VERIFY_HOME" | sed "s/'/'\\\\''/g") $(printf " '%s'" "$@" | sed "s/'/'\\\\''/g")"
+}
+verify_as_builder() { run_as_builder "$@" >/dev/null 2>&1; }
+
 echo "Installing Ansible collections ..."
-"$LIB/agent-isolation/bin/ansible-galaxy" collection install \
-    -r "$WORK/requirements.yml" \
-    -p "$LIB/collections" \
-    --force || {
+COLLECTIONS_STAGE="$STAGE/collections"
+install -d -m 0755 -o "$BUILD_USER" -g "$BUILD_USER" "$COLLECTIONS_STAGE"
+verify_as_builder "$LIB/agent-isolation/bin/ansible-galaxy" collection install \
+    -r "$WORK/requirements.yml" -p "$COLLECTIONS_STAGE" --force || {
     echo "install.sh: the collections failed; keeping the previous install" >&2
     exit 1
 }
+rm -rf "$LIB/collections"
+mv "$COLLECTIONS_STAGE" "$LIB/collections"
 
-# Verify the INSTALL, not the checkout: this is exactly what root will execute.
-"$LIB/agent-isolation/bin/python" -I -c 'import agent_isolation' || {
+# Verify the INSTALL, not the checkout. The artifact was built from a checkout
+# the invoking user controls, so its code is not executed as root here.
+
+verify_as_builder "$LIB/agent-isolation/bin/python" -I -c 'import agent_isolation' || {
     echo "install.sh: the installed code does not import; keeping the previous install" >&2
     exit 1
 }
-"$LIB/agent-isolation/bin/python" -I -c 'import ansible' || {
+verify_as_builder "$LIB/agent-isolation/bin/python" -I -c 'import ansible' || {
     echo "install.sh: the installed Ansible does not import; keeping the previous install" >&2
     exit 1
 }
-"$LIB/agent-isolation/bin/ansible-playbook" --version >/dev/null || {
+verify_as_builder "$LIB/agent-isolation/bin/ansible-playbook" --version || {
     echo "install.sh: the installed playbook binary fails; keeping the previous install" >&2
     exit 1
 }
@@ -299,9 +348,10 @@ chmod -R go-w "$LIB"
 # Past this point the new tree is the one to keep, and the trap leaves it alone.
 COMMITTED=yes
 
+INSTALLED_CODE=$(run_as_builder "$LIB/agent-isolation/bin/python" -I -c 'import agent_isolation, os; print(os.path.dirname(agent_isolation.__file__))' 2>/dev/null || printf '%s' "$LIB/agent-isolation")
 echo
 echo "Installed:"
-echo "  code        $("$LIB/agent-isolation/bin/python" -I -c 'import agent_isolation, os; print(os.path.dirname(agent_isolation.__file__))')"
+echo "  code        $INSTALLED_CODE"
 echo "  collections $LIB/collections"
 echo "  command     $BIN"
 echo
