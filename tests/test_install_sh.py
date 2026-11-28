@@ -717,10 +717,14 @@ class InstallLifecycleHarness:
         self._write_shims()
 
     def _write_shims(self):
+        self._install_base_shims()
+
+    def _install_base_shims(self):
         real_stat = shutil.which('stat', path='/usr/bin:/bin') or '/usr/bin/stat'
         stat_real = self.shim / 'stat.real'
-        shutil.copy2(real_stat, stat_real)
-        stat_real.chmod(0o755)
+        if not stat_real.exists():
+            shutil.copy2(real_stat, stat_real)
+            stat_real.chmod(0o755)
         (self.shim / 'stat').write_text(
             textwrap.dedent(f"""\
                 #!/bin/sh
@@ -784,7 +788,23 @@ class InstallLifecycleHarness:
                 """),
             encoding='utf-8',
         )
-        for name in ('stat', 'chown', 'chmod', 'runuser', 'su'):
+        real_uv = shutil.which('uv', path='/usr/bin:/bin:/usr/sbin:/sbin') or 'uv'
+        real_python = shutil.which('python3', path='/usr/bin:/bin:/usr/sbin:/sbin') or sys.executable
+        (self.shim / 'uv').write_text(
+            textwrap.dedent(f"""\
+                #!/bin/sh
+                exec {real_uv!s} "$@"
+                """),
+            encoding='utf-8',
+        )
+        (self.shim / 'python3').write_text(
+            textwrap.dedent(f"""\
+                #!/bin/sh
+                exec {real_python!s} "$@"
+                """),
+            encoding='utf-8',
+        )
+        for name in ('stat', 'chown', 'chmod', 'runuser', 'su', 'uv', 'python3'):
             (self.shim / name).chmod(0o755)
 
     def install_env(self):
@@ -801,19 +821,29 @@ class InstallLifecycleHarness:
 
     def run_install(self, *args, fail_at: str | None = None, timeout: int = 300):
         env = self.install_env()
+        self._install_base_shims()
         if fail_at:
             env['FAIL_AT'] = fail_at
             self._install_failure_shims()
+        real_uv = shutil.which('uv', path='/usr/bin:/bin:/usr/sbin:/sbin') or 'uv'
+        real_python = shutil.which('python3', path='/usr/bin:/bin:/usr/sbin:/sbin') or sys.executable
+        env['REAL_UV'] = real_uv
+        env['REAL_PYTHON3'] = real_python
+        # install.sh resets PATH and resolves tools from /usr/sbin:/usr/bin:/sbin:/bin,
+        # so PATH-based shims are ignored; bind-mount them over the real locations.
+        bind_cmds = [
+            'mount --bind "$SHIM/stat" /usr/bin/stat',
+            'mount --bind "$SHIM/chown" /usr/bin/chown',
+            'mount --bind "$SHIM/chmod" /usr/bin/chmod',
+            'mount --bind "$SHIM/runuser" /usr/sbin/runuser',
+            'mount --bind "$SHIM/su" /usr/bin/su',
+            'mount --bind "$SHIM/uv" "$REAL_UV"',
+            'mount --bind "$SHIM/python3" "$REAL_PYTHON3"',
+        ]
         cmd = [
             'unshare', '--user', '--map-root-user', '--mount', '--propagation', 'private',
             'sh', '-c',
-            'set -eu; '
-            'mount --bind "$SHIM/stat" /usr/bin/stat; '
-            'mount --bind "$SHIM/chown" /usr/bin/chown; '
-            'mount --bind "$SHIM/chmod" /usr/bin/chmod; '
-            'mount --bind "$SHIM/runuser" /usr/sbin/runuser; '
-            'mount --bind "$SHIM/su" /usr/bin/su; '
-            'shift; exec sh "$INSTALL_SH" "$@"',
+            'set -eu; ' + '; '.join(bind_cmds) + '; shift; exec sh "$INSTALL_SH" "$@"',
             'sh', str(INSTALL_SH), *args,
         ]
         env['SHIM'] = str(self.shim)
