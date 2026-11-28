@@ -233,8 +233,38 @@ are objects (`Deps.accounts`, `Runner._exec`, `Deps.ansible_factory`, `Deps.exec
 rather than stub binaries. Tests that exercise real `setfacl`/`getfacl` create throwaway
 trees and skip when the tools are absent.
 
-`apply` needs root and is not covered by the suite; `check` is the verdict you run on a
+`apply` needs root and is not covered by that suite; `check` is the verdict you run on a
 real host.
+
+### The installer, on a real VM
+
+`tests/test_install_sh.py` covers `install.sh`'s logic with root operations shimmed, which
+cannot answer "does `chown` really reach root, does `runuser` really drop privileges, does
+the lock resolve over the network". So there is a second suite that boots Fedora Cloud
+under KVM and runs the shipped script as root, with nothing stubbed in the guest:
+
+```console
+$ AGENT_ISOLATION_VM_TEST=1 python3 -m unittest tests.test_vm_install -v
+```
+
+It is opt-in and skips without that variable, so the ordinary suite stays fast and
+offline. It needs `/dev/kvm`, `qemu-system-x86_64`, `genisoimage` and `ssh`, and downloads
+the Cloud image once into `~/.cache/isolation-vm/` (about 600 MB, digest-verified). Each
+run boots a fresh overlay of the cached base, so the base is never mutated and the VM is
+destroyed afterwards even on failure.
+
+| Variable | Meaning |
+|---|---|
+| `AGENT_ISOLATION_VM_IMAGE` | use this local qcow2 instead of downloading |
+| `AGENT_ISOLATION_VM_IMAGE_SHA256` | verify that image (required for a non-default URL) |
+| `AGENT_ISOLATION_VM_CACHE` | where the download is cached |
+
+It asserts what only a booted host can show: the tree ends up root-owned and not
+group/world writable, the installed copy keeps working when the checkout is edited
+afterwards, the collections land where `resolve_ansible` looks, the console script runs
+for an unprivileged user, no build artifact is root-owned, `apply`/`check` succeed through
+the installed tool, an upgrade leaves no staging directory behind, a failed upgrade leaves
+the previous tree working, and `--uninstall` removes code without touching the account.
 
 ## Layout
 
@@ -244,6 +274,9 @@ src/agent_isolation/
   ansible/agent-account.yml   the declarative half: group, account, home, ACLs
   ansible/requirements.yml    the pinned collection
 tests/test_agent_account.py   the suite
+tests/test_install_sh.py      install.sh, with root operations shimmed
+tests/test_vm_install.py      install.sh end to end on a booted VM (opt-in)
+tests/vm_harness.py           the cloud-init/KVM harness that suite uses
 install.sh                    the root-owned install
 ```
 

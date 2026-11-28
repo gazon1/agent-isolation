@@ -203,7 +203,15 @@ secure_tmp_root() {
         return 0
     fi
     local_parent=${AGENT_ISOLATION_INSTALL_TMPROOT:-/var/lib/agent-isolation}
+    # Create the parent BEFORE the mode is set to the final one, and make it
+    # traverse-only rather than 0700. Measured on Fedora 43: with the parent at
+    # 0700 the unprivileged build could not create its output directory inside
+    # WORK — it answers "failed to create directory ...: Permission denied" —
+    # because the build runs as $SUDO_USER and cannot pass through a root-only
+    # parent to reach a directory it owns. 0711 is the same rule already applied
+    # to the staging root below: reachable by name, not listable.
     install -d -m 0700 -o root -g root "$local_parent"
+    chmod 0711 "$local_parent"
     assert_trusted "$local_parent"
     SECURE_TMPROOT=$(TMPDIR= mktemp -d "$local_parent/install-tmp.XXXXXX")
     chown root:root "$SECURE_TMPROOT"
@@ -216,7 +224,13 @@ secure_tmp_root() {
 secure_mktemp_dir() {
     dir=$(TMPDIR= mktemp -d "$(secure_tmp_root)/$1.XXXXXX")
     chown root:root "$dir"
-    chmod 0700 "$dir"
+    # Traverse-only, for the same reason the staging root above is 0711: the build
+    # runs as $SUDO_USER and must reach the subdirectories created for it inside
+    # this one (WORK, STAGE/collections, STAGE/verify-home). At 0700 it cannot, and
+    # the failure surfaces far from the cause — measured on Fedora 43 as
+    # "the collections failed" with the galaxy output discarded. 0711 grants no
+    # write and no listing: anything secret gets its own 0700 below.
+    chmod 0711 "$dir"
     assert_trusted "$dir"
     printf '%s\n' "$dir"
 }
@@ -374,6 +388,9 @@ fi
 if [ -d "$LIB" ]; then
     BACKUP="$STAGE/previous"
     cp -a -- "$LIB" "$BACKUP"
+    # STAGE is traverse-only so the builder can reach its own subdirectories; the
+    # backup is the one thing in it that must stay root-only.
+    chmod 0700 "$BACKUP"
     BACKUP_READY=yes
 fi
 

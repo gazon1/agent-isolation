@@ -347,8 +347,14 @@ def trusted_tmp_parent() -> Path:
     if not owner_ok:
         owner = f"uid {os.geteuid()}" if (override or os.geteuid() != 0) else "root"
         raise AgentAccountError(f"trusted temp parent {parent} is owned by uid {st.st_uid}, not {owner}")
-    if st.st_mode & 0o077:
-        raise AgentAccountError(f"trusted temp parent {parent} must not be group/world accessible")
+    # WRITE is the risk, not traverse. `install.sh` creates this parent 0711 on
+    # purpose: the unprivileged build must reach the staging directory it owns
+    # inside it, and a 0700 parent makes that impossible (measured on Fedora 43).
+    # Traverse alone exposes nothing — the staging directories and this tool's own
+    # ansible temp dir are 0700, so a stranger can name a path but not list, enter
+    # or alter what is there. The same rule `assert_trusted` applies.
+    if st.st_mode & 0o022:
+        raise AgentAccountError(f"trusted temp parent {parent} is group/world writable")
     return parent
 
 

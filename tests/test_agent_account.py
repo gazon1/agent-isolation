@@ -3048,14 +3048,25 @@ class TrustedTempParentTest(unittest.TestCase):
                 aa.trusted_tmp_parent()
         self.assertIn('owned by uid', str(caught.exception))
 
-    def test_a_group_accessible_override_is_refused(self):
+    def test_a_group_writable_override_is_refused(self):
+        """WRITE is the risk. Traverse is deliberate: `install.sh` creates this
+        parent 0711 so the unprivileged build can reach its own staging directory
+        inside it (measured on Fedora 43 — 0700 made the build fail)."""
         override = self.root / 'open'
         override.mkdir()
-        override.chmod(0o750)
+        override.chmod(0o770)
         os.environ['AGENT_ISOLATION_TRUSTED_TMP'] = str(override)
         with self.assertRaises(aa.AgentAccountError) as caught:
             aa.trusted_tmp_parent()
-        self.assertIn('group/world accessible', str(caught.exception))
+        self.assertIn('group/world writable', str(caught.exception))
+
+    def test_a_traversable_0711_override_is_accepted(self):
+        """The shape `install.sh` creates, and only that: no write, no listing."""
+        override = self.root / 'staging-parent'
+        override.mkdir()
+        override.chmod(0o711)
+        os.environ['AGENT_ISOLATION_TRUSTED_TMP'] = str(override)
+        self.assertEqual(override, aa.trusted_tmp_parent())
 
     def test_the_ansible_config_lands_in_the_trusted_parent_not_the_caller_tempdir(self):
         """End of the chain: the config's DIRECTORY is the trusted one."""

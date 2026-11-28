@@ -569,6 +569,24 @@ class SecureTmpRootTest(unittest.TestCase):
                 return line.split('=', 1)[1]
         self.fail(f'{name}= missing from {stdout!r}')
 
+    def test_the_staging_parent_is_traversable_by_the_builder(self):
+        """The build runs as $SUDO_USER and must reach its own WORK directory.
+
+        Measured on Fedora 43 by the VM suite: with the parent at 0700 the build
+        answers "failed to create directory ...: Permission denied" even though WORK
+        is owned by the builder — a 0700 ancestor cannot be passed through at all.
+        Group and other get `x` only: reachable by name, never listable, and never
+        writable, so this is not a loosening of the trust check that follows.
+        """
+        parent = self.fake_root / 'secure'
+        result = self._run(inherited_tmpdir=self.tmp, parent=parent)
+        self.assertEqual(0, result.returncode, result.stderr)
+        mode = parent.stat().st_mode & 0o777
+        self.assertEqual(0o711, mode, f'the staging parent is {mode:#o}, the builder cannot traverse it')
+        self.assertEqual(0, parent.stat().st_mode & 0o022, 'the parent must not be writable')
+        # `assert_trusted` still accepts it: 0711 has no group/world write bit.
+        self.assertNotIn('group- or world-writable', result.stderr)
+
     def test_the_staging_root_is_not_created_in_the_inherited_tmpdir(self):
         """The whole point: `TMPDIR` names the ATTACKER's directory, and the
         staging tree must not appear there."""
@@ -626,14 +644,19 @@ class SecureTmpRootTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn('not root', result.stderr)
 
-    def test_work_is_a_distinct_0700_directory_inside_the_staging_root(self):
+    def test_the_staging_root_is_traversable_and_not_writable(self):
         parent = self.fake_root / 'secure'
         result = self._run(inherited_tmpdir=self.tmp, parent=parent)
         self.assertEqual(0, result.returncode, result.stderr)
         root = pathlib.Path(self._field(result.stdout, 'ROOT'))
         work = pathlib.Path(self._field(result.stdout, 'WORK'))
         self.assertEqual(root, work.parent, 'WORK lives inside the staging root')
-        self.assertEqual(0o700, work.stat().st_mode & 0o777, 'WORK is root-only')
+        # 0711: the builder must traverse into its own WORK, and the measured
+        # failure at 0700 was "the collections failed" with the cause hidden.
+        self.assertEqual(0o711, work.stat().st_mode & 0o777,
+                         'the staging dir must be traversable by the builder')
+        self.assertEqual(0, work.stat().st_mode & 0o022,
+                         'the staging dir must not be group/world writable')
 
     def test_both_directories_share_one_staging_root(self):
         """Measured bug: `SECURE_TMPROOT` was assigned inside `$(...)`, so the
