@@ -588,27 +588,30 @@ class Ansible:
         ]
         if check:
             argv += ["--check", "--diff"]
-        env = self._environment()
-
-        with tempfile.NamedTemporaryFile(
-            "w", prefix="agent-account-vars-", suffix=".json", delete=False, encoding="utf-8"
-        ) as handle:
-            json.dump(variables, handle, indent=2, sort_keys=True)
-            vars_path = handle.name
-        os.chmod(vars_path, 0o600)
-        argv += ["-e", f"@{vars_path}"]
-        run_error: Exception | None = None
+        vars_path: str | None = None
+        result: subprocess.CompletedProcess[bytes] | None = None
+        run_error: BaseException | None = None
         try:
+            env = self._environment()
+            with tempfile.NamedTemporaryFile(
+                "w", prefix="agent-account-vars-", suffix=".json", delete=False, encoding="utf-8"
+            ) as handle:
+                vars_path = handle.name
+                json.dump(variables, handle, indent=2, sort_keys=True)
+            os.chmod(vars_path, 0o600)
+            argv += ["-e", f"@{vars_path}"]
             # `cwd` is explicit: Ansible's config search includes `./ansible.cfg`,
             # so inheriting the caller's directory is itself the vulnerability.
             result = subprocess.run(argv, env=env, cwd=env["ANSIBLE_LOCAL_TEMP"], check=False)
-        except Exception as error:
+        except BaseException as error:
             run_error = error
-            result = None
         finally:
             cleanup_errors: list[str] = []
-            with contextlib.suppress(OSError):
-                os.unlink(vars_path)
+            if vars_path is not None:
+                try:
+                    os.unlink(vars_path)
+                except OSError as error:
+                    cleanup_errors.append(f"{vars_path}: {error}")
             for path in self._configs:
                 try:
                     os.unlink(path)
@@ -622,6 +625,8 @@ class Ansible:
                     cleanup_errors.append(f"{path}: {error}")
             self._tempdirs.clear()
         if run_error is not None:
+            if cleanup_errors:
+                eprint(f"{SELF_NAME}: warning: could not remove temporary files: {'; '.join(cleanup_errors)}")
             raise run_error
         if cleanup_errors:
             eprint(f"{SELF_NAME}: warning: could not remove temporary files: {'; '.join(cleanup_errors)}")

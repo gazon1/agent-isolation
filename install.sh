@@ -157,10 +157,6 @@ assert_trusted "$UV"
 # $LIB itself is checked too — an existing directory owned by somebody else, or
 # writable by them, is a place `uv` would run as root inside.
 assert_trusted "$PREFIX/lib" "$PREFIX/bin" "$LIB"
-# Created 0755 and root-owned by this root-owned call: the mode is set explicitly
-# because the caller's umask must not be able to loosen it.
-install -d -m 0755 -o root -g root "$LIB"
-
 # -- build as the INVOKING user, install as root -------------------------------
 #
 # Measured: `uv tool install .` runs the project's build backend, and a malicious
@@ -187,12 +183,7 @@ fi
 BUILD_USER=${SUDO_USER:-$(id -un)}
 BUILD_GROUP=$(id -gn "$BUILD_USER")
 
-# The builder runs as the CALLER and must be able to write its output here, so the
-# directory is owned by that user. `mktemp -d` alone is 0700 root, which made the
-# build fail with a bare "failed" — measured.
-WORK=$(mktemp -d)
-chown "$BUILD_USER:$BUILD_GROUP" "$WORK"
-chmod 0755 "$WORK"
+WORK=""
 STAGE=""
 BACKUP=""
 BACKUP_READY=no
@@ -200,42 +191,49 @@ INSTALL_STARTED=no
 COMMITTED=no
 CLEANUP_STATUS=0
 CLEANUP_DONE=no
+LIB_PREEXISTING=no
+LIB_CREATED=no
 
 cleanup() {
     CLEANUP_STATUS=$?
     set +e
-    if [ "$CLEANUP_DONE" = yes ]; then
+    if [ "${CLEANUP_DONE:-no}" = yes ]; then
         exit "$CLEANUP_STATUS"
     fi
     CLEANUP_DONE=yes
     trap '' INT TERM
-    if [ "$COMMITTED" = yes ]; then
-        [ -n "$STAGE" ] && rm -rf -- "$STAGE"
-        [ -n "$WORK" ] && rm -rf -- "$WORK"
+    if [ "${COMMITTED:-no}" = yes ]; then
+        [ -n "${STAGE:-}" ] && rm -rf -- "$STAGE"
+        [ -n "${WORK:-}" ] && rm -rf -- "$WORK"
         exit "$CLEANUP_STATUS"
     fi
-    if [ "$INSTALL_STARTED" = yes ] && [ "$BACKUP_READY" = yes ] && [ -n "$BACKUP" ] && [ -d "$BACKUP" ]; then
+    if [ "${INSTALL_STARTED:-no}" = yes ] && [ "${BACKUP_READY:-no}" = yes ] && [ -n "${BACKUP:-}" ] && [ -d "$BACKUP" ]; then
         rm -rf -- "$LIB"
         if mv -- "$BACKUP" "$LIB"; then
             echo "install.sh: rolled back to the previous installation" >&2
             BACKUP=""
-            [ -n "$STAGE" ] && rm -rf -- "$STAGE"
-            [ -n "$WORK" ] && rm -rf -- "$WORK"
+            [ -n "${STAGE:-}" ] && rm -rf -- "$STAGE"
+            [ -n "${WORK:-}" ] && rm -rf -- "$WORK"
         else
             echo "install.sh: COULD NOT ROLL BACK; the previous tree is at $BACKUP" >&2
             echo "install.sh: staging directory preserved at $STAGE" >&2
-            [ -n "$WORK" ] && rm -rf -- "$WORK"
+            [ -n "${WORK:-}" ] && rm -rf -- "$WORK"
         fi
-    elif [ "$INSTALL_STARTED" = yes ]; then
+    elif [ "${INSTALL_STARTED:-no}" = yes ]; then
         # First install or no usable backup: remove the partial install rather than
         # leaving a half-installed root-owned tree behind.
         rm -rf -- "$LIB"
-        [ -n "$STAGE" ] && rm -rf -- "$STAGE"
-        [ -n "$WORK" ] && rm -rf -- "$WORK"
+        [ -n "${STAGE:-}" ] && rm -rf -- "$STAGE"
+        [ -n "${WORK:-}" ] && rm -rf -- "$WORK"
     else
-        # Install never started mutating $LIB; leave any existing install alone.
-        [ -n "$STAGE" ] && rm -rf -- "$STAGE"
-        [ -n "$WORK" ] && rm -rf -- "$WORK"
+        # Install never started mutating $LIB. If this run created $LIB for a
+        # first install, remove that empty directory; leave pre-existing installs
+        # alone.
+        if [ "${LIB_CREATED:-no}" = yes ] && [ "${LIB_PREEXISTING:-no}" = no ]; then
+            rm -rf -- "$LIB"
+        fi
+        [ -n "${STAGE:-}" ] && rm -rf -- "$STAGE"
+        [ -n "${WORK:-}" ] && rm -rf -- "$WORK"
     fi
     exit "$CLEANUP_STATUS"
 }
@@ -243,6 +241,24 @@ cleanup() {
 trap 'cleanup' EXIT
 trap 'CLEANUP_STATUS=130; exit 130' INT
 trap 'CLEANUP_STATUS=143; exit 143' TERM
+
+# Created 0755 and root-owned by this root-owned call: the mode is set explicitly
+# because the caller's umask must not be able to loosen it. The cleanup trap is
+# already active, so a failure after this point cannot leave a fresh first-install
+# $LIB behind.
+if [ -d "$LIB" ] || [ -L "$LIB" ] || [ -e "$LIB" ]; then
+    LIB_PREEXISTING=yes
+else
+    LIB_CREATED=yes
+fi
+install -d -m 0755 -o root -g root "$LIB"
+
+# The builder runs as the CALLER and must be able to write its output here, so the
+# directory is owned by that user. `mktemp -d` alone is 0700 root, which made the
+# build fail with a bare "failed" — measured.
+WORK=$(mktemp -d)
+chown "$BUILD_USER:$BUILD_GROUP" "$WORK"
+chmod 0755 "$WORK"
 
 echo "Building the wheel as $BUILD_USER (no root code execution) ..."
 # `runuser` first: it does not prompt (we are root) and it preserves the
@@ -271,21 +287,26 @@ PYEOF
 
 # THE LOCK IS THE RESOLUTION. A wheel carries RANGES (`click<9,>=8.1`), not
 # versions, so installing it alone re-resolves and can produce a different runtime
-# from the same commit. `uv export` turns the committed lock into exact pins and
-# `--constraints` makes the install honour them; a lock/range disagreement then
-# fails instead of silently drifting.
+# from the same commit. `uv export` turns the committed lock into a hashed
+# requirements file and `uv pip install --require-hashes` verifies every
+# downloaded artifact against those hashes; a lock/range disagreement or a bad
+# artifact then fails instead of silently drifting.
 #
-# Exported by the BUILDING user from the checkout, then read by root as data — it is
-# a list of `name==version` lines, not code.
-CONSTRAINTS="$WORK/constraints.txt"
+# Exported by the BUILDING user from the checkout, then read by root as data.
+# The file contains pinned versions and hashes, not executable code.
+REQUIREMENTS="$WORK/requirements-hashed.txt"
 if ! runuser -u "$BUILD_USER" -- "$UV" export \
-        --project "$SOURCE" --format requirements-txt --no-hashes --no-emit-project \
-        > "$CONSTRAINTS" 2>/dev/null; then
+        --project "$SOURCE" --format requirements-txt --frozen --no-emit-project \
+        > "$REQUIREMENTS" 2>/dev/null; then
     echo "install.sh: cannot export the dependency lock; refusing to resolve freely" >&2
     exit 1
 fi
-if [ ! -s "$CONSTRAINTS" ]; then
+if [ ! -s "$REQUIREMENTS" ]; then
     echo "install.sh: the exported lock is empty — is uv.lock committed?" >&2
+    exit 1
+fi
+if ! grep -q -- '--hash=' "$REQUIREMENTS"; then
+    echo "install.sh: exported requirements contain no hashes; refusing to install without lock verification" >&2
     exit 1
 fi
 
@@ -319,18 +340,27 @@ if [ -d "$LIB" ]; then
     BACKUP_READY=yes
 fi
 
-# `--no-build`: the ONLY thing root accepts is a prebuilt wheel and cached wheels
-# of the dependencies. `agent-isolation` itself is never built here. Past this
-# point the install mutates $LIB and cleanup may restore or remove it.
+# Root never executes checkout code and never builds distributions. Dependencies
+# come from the committed lock as hashed requirements; `--require-hashes`
+# verifies every artifact, `--no-deps` keeps the wheel itself explicit, and
+# `--no-build` refuses source builds. Past this point the install mutates $LIB
+# and cleanup may restore or remove it.
 INSTALL_STARTED=yes
 echo "Installing the tool into $LIB ..."
-UV_TOOL_DIR="$LIB" UV_TOOL_BIN_DIR="$LIB/bin-dir" "$UV" tool install \
-    --python /usr/bin/python3 \
+install -d -m 0755 -o root -g root "$LIB"
+"$UV" venv --clear --python /usr/bin/python3 "$LIB/agent-isolation" >/dev/null
+"$UV" pip install \
+    --python "$LIB/agent-isolation/bin/python" \
+    --require-hashes \
+    --no-deps \
     --no-build \
-    --constraints "$CONSTRAINTS" \
-    --force \
-    "$WHEEL"
-ln -sfn "$LIB/bin-dir/agent-account" "$BIN"
+    -r "$REQUIREMENTS" >/dev/null
+"$UV" pip install \
+    --python "$LIB/agent-isolation/bin/python" \
+    --no-deps \
+    --no-build \
+    "$WHEEL" >/dev/null
+ln -sfn "$LIB/agent-isolation/bin/agent-account" "$BIN"
 
 # The installed artifact comes from the invoking user's checkout, so anything
 # that executes it runs as that user in a throwaway HOME, never as root.

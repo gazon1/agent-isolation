@@ -2158,6 +2158,73 @@ class AnsibleIsolationTest(unittest.TestCase):
         self.assertFalse(config.exists())
         self.assertFalse(temp.exists())
 
+    def test_run_cleans_temp_resources_when_vars_file_creation_fails(self):
+        instance = self._ansible()
+        with mock.patch('tempfile.NamedTemporaryFile', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError) as caught:
+                instance.run({'x': 1})
+        self.assertEqual('disk full', str(caught.exception))
+        self.assertEqual([], instance._configs)
+        self.assertEqual([], instance._tempdirs)
+
+    def test_run_cleans_temp_resources_when_vars_dump_fails(self):
+        instance = self._ansible()
+        with mock.patch('json.dump', side_effect=ValueError('bad json')):
+            with self.assertRaises(ValueError) as caught:
+                instance.run({'x': 1})
+        self.assertEqual('bad json', str(caught.exception))
+        self.assertEqual([], instance._configs)
+        self.assertEqual([], instance._tempdirs)
+
+    def test_run_cleans_temp_resources_when_vars_chmod_fails(self):
+        instance = self._ansible()
+        import os as _os
+        real_chmod = _os.chmod
+
+        def fail_vars_chmod(path, mode):
+            if str(path).endswith('.json'):
+                raise PermissionError('chmod failed')
+            return real_chmod(path, mode)
+
+        with mock.patch('os.chmod', side_effect=fail_vars_chmod):
+            with self.assertRaises(PermissionError) as caught:
+                instance.run({'x': 1})
+        self.assertEqual('chmod failed', str(caught.exception))
+        self.assertEqual([], instance._configs)
+        self.assertEqual([], instance._tempdirs)
+
+    def test_run_cleans_config_when_tempdir_creation_fails(self):
+        instance = self._ansible()
+        real_mkdtemp = tempfile.mkdtemp
+
+        def fail_mkdtemp(*args, **kwargs):
+            raise OSError('mkdtemp failed')
+
+        with mock.patch('tempfile.mkdtemp', side_effect=fail_mkdtemp):
+            with self.assertRaises(OSError) as caught:
+                instance.run({'x': 1})
+        self.assertEqual('mkdtemp failed', str(caught.exception))
+        self.assertEqual([], instance._configs)
+        self.assertEqual([], instance._tempdirs)
+
+    def test_run_preserves_original_error_when_cleanup_fails(self):
+        instance = self._ansible()
+        stderr = io.StringIO()
+        real_rmtree = shutil.rmtree
+
+        def fail_rmtree(path, *args, **kwargs):
+            if 'agent-account-ansible-' in str(path):
+                raise OSError('rmtree failed')
+            return real_rmtree(path, *args, **kwargs)
+
+        with mock.patch('subprocess.run', side_effect=RuntimeError('run failed')):
+            with mock.patch('shutil.rmtree', side_effect=fail_rmtree):
+                with mock.patch('sys.stderr', stderr):
+                    with self.assertRaises(RuntimeError) as caught:
+                        instance.run({'x': 1})
+        self.assertEqual('run failed', str(caught.exception))
+        self.assertIn('warning: could not remove temporary files', stderr.getvalue())
+
 
 class AnsibleResolutionTest(unittest.TestCase):
     """Ansible is resolved from the INSTALLATION, and nothing else.

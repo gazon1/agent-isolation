@@ -59,8 +59,8 @@ What runs as which identity:
 | Step | Runs as | Purpose |
 |---|---|---|
 | `uv build --wheel` | invoking user (`$SUDO_USER`) | build wheel from checkout without root build hooks |
-| `uv export` constraints | invoking user (`$SUDO_USER`) | export committed lock as install constraints |
-| Path/trust checks, staging, `uv tool install --no-build`, symlink, `chown`/`chmod`, install rollback | root | trusted filesystem and package placement into the install prefix |
+| `uv export --frozen --format requirements-txt` | invoking user (`$SUDO_USER`) | export the committed lock as hashed requirements (artifact hashes included) |
+| Path/trust checks, staging, `uv venv`, `uv pip install --require-hashes --no-deps --no-build`, symlink, `chown`/`chmod`, install rollback | root | trusted filesystem and package placement into the install prefix; dependency artifacts are verified against lock hashes |
 | `ansible-galaxy collection install` | invoking user (`$SUDO_USER`) | install collections without executing artifact code as root |
 | Post-install `python -I -c ...` / `ansible-playbook --version` checks | invoking user (`$SUDO_USER`) | verify installed artifact without executing it as root |
 
@@ -69,11 +69,15 @@ The installer resets `PATH` to a known-safe value before privileged operations a
 root-owned or are group/world-writable. For paths that do not exist yet, it validates the
 nearest existing ancestor before creating directories.
 
-**Artifact trust boundary:** the wheel is built from the trusted checkout by the invoking
-user, so the checkout can influence the installed artifact. Root does not execute build
-hooks or artifact verification/collection-install code during installation, but a
-compromised wheel is still a compromised install. Treat the checkout, including
-`install.sh`, and the build environment as part of the trusted computing base.
+**Artifact and dependency trust boundary:** the wheel is built from the trusted checkout
+by the invoking user, so the checkout can influence the installed artifact. Root does
+not execute build hooks or artifact verification/collection-install code during
+installation, but a compromised wheel is still a compromised install. Dependency
+resolution is fixed by `uv.lock`; `install.sh` exports hashed requirements from that
+lock and installs dependencies with `uv pip install --require-hashes --no-deps
+--no-build`, so dependency artifacts are verified against lock hashes rather than
+selected only by version. Treat the checkout, including `install.sh`, and the build
+environment as part of the trusted computing base.
 
 The checkout is never linked into what root executes. Delete or modify it afterwards and
 `apply` still runs the same installed code.

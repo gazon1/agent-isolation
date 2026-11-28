@@ -15,6 +15,7 @@ import pathlib
 import shutil
 import stat as stat_module
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -82,8 +83,8 @@ class AssertTrustedTest(unittest.TestCase):
     def test_a_directory_owned_by_somebody_else_is_refused(self):
         """The attack: pre-create the install root as an unprivileged user.
 
-        Root would then run `uv tool install` inside a tree the attacker owns, and
-        the later `chown -R root:root` comes too late — the content is already in.
+        Root would then install into a tree the attacker owns, and the later
+        `chown -R root:root` comes too late — the content is already in.
         """
         target = self.work / 'agent-isolation'
         target.mkdir()
@@ -175,8 +176,8 @@ class GuardOrderTest(unittest.TestCase):
 
     def test_the_guard_runs_before_uv_writes_anything(self):
         guard = self.text.index('assert_trusted "$PREFIX/lib" "$PREFIX/bin" "$LIB"')
-        uv = self.text.index('uv tool install')
-        self.assertLess(guard, uv, 'the guard runs before uv installs as root')
+        uv = self.text.index('"$UV" venv --clear --python /usr/bin/python3 "$LIB/agent-isolation"')
+        self.assertLess(guard, uv, 'the guard runs before uv writes into the install root')
 
     def test_the_created_directory_has_an_explicit_secure_mode(self):
         """`mkdir -p` honours the caller's umask; `install -d -m` does not."""
@@ -373,16 +374,24 @@ class DependencyLockTest(unittest.TestCase):
     def test_the_lock_file_is_committed(self):
         self.assertTrue(self.lock.is_file(), 'uv.lock is the authoritative pin')
 
-    def test_the_lock_is_exported_and_passed_as_constraints(self):
+    def test_the_lock_is_exported_with_hashes_and_installed_with_verification(self):
         self.assertIn('"$UV" export', self.text)
         self.assertIn('--format requirements-txt', self.text)
-        install = self.text.index('"$UV" tool install')
-        segment = self.text[install:install + 400]
-        self.assertIn('--constraints "$CONSTRAINTS"', segment)
+        export_segment = self.text.split('"$UV" export', 1)[1].split('> "$REQUIREMENTS"', 1)[0]
+        self.assertNotIn('--no-hashes', export_segment)
+        self.assertIn('--frozen', export_segment)
+        install = self.text.index('"$UV" pip install \\\n    --python "$LIB/agent-isolation/bin/python" \\\n    --require-hashes')
+        segment = self.text[install:install + 300]
+        self.assertIn('--require-hashes', segment)
+        self.assertIn('--no-deps', segment)
+        self.assertIn('--no-build', segment)
+        self.assertIn('-r "$REQUIREMENTS"', segment)
+        self.assertIn("grep -q -- '--hash=' \"$REQUIREMENTS\"", self.text)
 
     def test_a_missing_lock_refuses_instead_of_resolving_freely(self):
         self.assertIn('cannot export the dependency lock', self.text)
         self.assertIn('is uv.lock committed?', self.text)
+        self.assertIn('exported requirements contain no hashes; refusing to install without lock verification', self.text)
 
     def test_the_date_cutoff_is_not_the_pin(self):
         """`--exclude-newer` limits the index window; it does NOT reproduce a lock."""
@@ -406,12 +415,12 @@ class UpgradeSafetyTest(unittest.TestCase):
 
     def test_the_build_happens_before_the_installed_tree_is_touched(self):
         build = self.text.index('build --wheel --out-dir "$WORK"')
-        install = self.text.index('"$UV" tool install')
+        install = self.text.index('INSTALL_STARTED=yes')
         self.assertLess(build, install, 'a build failure leaves the old install alone')
 
     def test_a_failed_build_aborts_before_any_install(self):
         refusal = self.text.index('refusing to build as root')
-        next_install = self.text.index('"$UV" tool install')
+        next_install = self.text.index('INSTALL_STARTED=yes')
         self.assertLess(refusal, next_install)
 
     def test_uninstall_removes_both_paths(self):
@@ -477,7 +486,8 @@ class RestoreBehaviorTest(unittest.TestCase):
 
     def _run(self, *, fail_mv: bool = False, backup_exists: bool = False,
              committed: bool = False, install_started: bool = True,
-             lib_exists: bool = True) -> subprocess.CompletedProcess:
+             lib_exists: bool = True, lib_preexisting: bool | None = None,
+             lib_created: bool | None = None) -> subprocess.CompletedProcess:
         lib = self.tmp / 'lib'
         stage = self.tmp / 'stage'
         work = self.tmp / 'work'
@@ -491,6 +501,10 @@ class RestoreBehaviorTest(unittest.TestCase):
         if backup_exists:
             backup.mkdir()
             (backup / 'old').write_text('backup', encoding='utf-8')
+        if lib_preexisting is None:
+            lib_preexisting = lib_exists
+        if lib_created is None:
+            lib_created = (not lib_preexisting) and lib_exists and (not install_started) and (not committed)
         shim = self.tmp / 'shim'
         shim.mkdir()
         real_rm = shutil.which('rm', path='/usr/bin:/bin') or '/bin/rm'
@@ -510,6 +524,8 @@ class RestoreBehaviorTest(unittest.TestCase):
             COMMITTED={'yes' if committed else 'no'}
             CLEANUP_STATUS=0
             CLEANUP_DONE=no
+            LIB_PREEXISTING={'yes' if lib_preexisting else 'no'}
+            LIB_CREATED={'yes' if lib_created else 'no'}
             {self.fn}
             trap 'cleanup' EXIT
             exit 1
@@ -572,6 +588,8 @@ class RestoreBehaviorTest(unittest.TestCase):
             COMMITTED=no
             CLEANUP_STATUS=0
             CLEANUP_DONE=no
+            LIB_PREEXISTING=yes
+            LIB_CREATED=no
             {self.fn}
             trap 'cleanup' EXIT
             exit 1
@@ -609,10 +627,10 @@ class TransactionTest(unittest.TestCase):
         backup = self.text.index('cp -a -- "$LIB" "$BACKUP"')
         ready = self.text.index('BACKUP_READY=yes')
         install = self.text.index('INSTALL_STARTED=yes')
-        uv_install = self.text.index('UV_TOOL_DIR="$LIB" UV_TOOL_BIN_DIR="$LIB/bin-dir" "$UV" tool install')
+        pip_install = self.text.index('"$UV" pip install \\\n    --python "$LIB/agent-isolation/bin/python" \\\n    --require-hashes')
         self.assertLess(backup, ready, 'backup is marked ready only after copy')
         self.assertLess(ready, install, 'install starts only after backup is ready')
-        self.assertLess(install, uv_install, 'mutation marker comes before uv install')
+        self.assertLess(install, pip_install, 'mutation marker comes before dependency install')
 
     def test_a_cleanup_trap_covers_every_failure_path(self):
         self.assertIn("trap 'cleanup' EXIT", self.text)
@@ -633,7 +651,7 @@ class TransactionTest(unittest.TestCase):
     def test_a_committed_install_is_not_rolled_back(self):
         """Otherwise a successful install would delete itself on exit."""
         self.assertIn('COMMITTED=yes', self.text)
-        self.assertIn('[ "$COMMITTED" = yes ]', self.text)
+        self.assertIn('[ "${COMMITTED:-no}" = yes ]', self.text)
 
     def test_the_staging_swap_is_not_used_for_a_venv(self):
         """Measured: `mv` a venv and every console script's absolute shebang breaks.
@@ -645,7 +663,7 @@ class TransactionTest(unittest.TestCase):
     def test_failed_restore_preserves_the_only_backup(self):
         """A backup that cannot be restored must not be deleted by the trap."""
         restore_else = self.text.index('COULD NOT ROLL BACK; the previous tree is at $BACKUP')
-        else_block = self.text[restore_else:self.text.index('elif [ "$INSTALL_STARTED" = yes ]', restore_else)]
+        else_block = self.text[restore_else:self.text.index('elif [ "${INSTALL_STARTED:-no}" = yes ]', restore_else)]
         self.assertNotIn('BACKUP=""', else_block)
         self.assertIn('staging directory preserved at $STAGE', else_block)
         self.assertNotIn('rm -rf -- "$STAGE" "$WORK"', else_block)
@@ -653,7 +671,7 @@ class TransactionTest(unittest.TestCase):
     def test_a_failed_first_install_removes_the_partial_tree(self):
         """With no backup, a failed install must not leave a partial root-owned tree."""
         cleanup = self.text[self.text.index('cleanup() {'):self.text.index("trap 'cleanup' EXIT")]
-        self.assertIn('INSTALL_STARTED" = yes', cleanup)
+        self.assertIn('INSTALL_STARTED:-no}" = yes', cleanup)
         self.assertIn('rm -rf -- "$LIB"', cleanup)
         self.assertIn('rm -rf -- "$STAGE"', cleanup)
         self.assertIn('rm -rf -- "$WORK"', cleanup)
@@ -662,6 +680,331 @@ class TransactionTest(unittest.TestCase):
         cleanup = self.text[self.text.index('cleanup() {'):self.text.index("trap 'cleanup' EXIT")]
         self.assertIn('rm -rf -- "$STAGE"', cleanup)
         self.assertIn('rm -rf -- "$WORK"', cleanup)
+
+    def test_cleanup_trap_is_installed_before_lib_creation(self):
+        trap = self.text.index("trap 'cleanup' EXIT")
+        create = self.text.index('install -d -m 0755 -o root -g root "$LIB"')
+        self.assertLess(trap, create, 'cleanup must be active before $LIB is created')
+
+    def test_pre_install_failure_removes_newly_created_lib(self):
+        cleanup = self.text[self.text.index('cleanup() {'):self.text.index("trap 'cleanup' EXIT")]
+        self.assertIn('LIB_CREATED', cleanup)
+        self.assertIn('LIB_PREEXISTING', cleanup)
+
+
+class InstallLifecycleHarness:
+    """Run the real install.sh in a user namespace with stubbed root operations.
+
+    No real root, no network. uv/build/python are real; filesystem ownership
+    checks and root-only commands are shimmed because the user namespace maps
+    the test user to uid 0 while host files remain owned by the overflow uid.
+    """
+
+    def __init__(self, tmp: pathlib.Path):
+        self.tmp = tmp
+        self.root = tmp / 'root'
+        self.prefix = self.root / 'usr/local'
+        self.lib = self.prefix / 'lib/agent-isolation'
+        self.bin = self.prefix / 'bin/agent-account'
+        self.shim = tmp / 'shim'
+        self.calls = tmp / 'calls'
+        self.state = tmp / 'state'
+        self.shim.mkdir()
+        self.calls.mkdir()
+        self.state.mkdir()
+        self.prefix.joinpath('lib').mkdir(parents=True)
+        self.prefix.joinpath('bin').mkdir(parents=True)
+        self._write_shims()
+
+    def _write_shims(self):
+        real_stat = shutil.which('stat', path='/usr/bin:/bin') or '/usr/bin/stat'
+        (self.shim / 'stat').write_text(
+            textwrap.dedent(f"""\
+                #!/bin/sh
+                # In the user namespace, host files appear as overflow uid; report
+                # them as root-owned and non-writable so assert_trusted exercises
+                # its real logic on controlled paths.
+                real={real_stat!s}
+                last=""; for a in "$@"; do last="$a"; done
+                case "$last" in
+                    "$FAKE_ROOT"/*|"$FAKE_ROOT")
+                        case "$*" in *%u*) echo 0; exit 0 ;; *%a*) echo 755; exit 0 ;; esac
+                        ;;
+                esac
+                out=$("$real" "$@" 2>/dev/null) || exit $?
+                case "$*" in
+                    *%u*) echo 0 ;;
+                    *%a*)
+                        mode=$(printf '%s' "$out" | tail -1)
+                        # Strip group/world write bits from the reported mode.
+                        printf '%o\n' "$(( 0$mode & ~022 ))"
+                        ;;
+                    *) printf '%s\n' "$out" ;;
+                esac
+                """),
+            encoding='utf-8',
+        )
+        for name in ('chown', 'chmod'):
+            (self.shim / name).write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALLS/{name}.log\"\nexit 0\n",
+                encoding='utf-8',
+            )
+        # runuser/su cannot switch users in this unprivileged userns; the build
+        # commands are safe uv/python invocations on trusted test fixtures.
+        (self.shim / 'runuser').write_text(
+            textwrap.dedent("""\
+                #!/bin/sh
+                # drop: runuser -u USER -- cmd...
+                while [ "$#" -gt 0 ]; do
+                    case "$1" in
+                        -u) shift 2 ;;
+                        --) shift; break ;;
+                        *) shift ;;
+                    esac
+                done
+                exec "$@"
+                """),
+            encoding='utf-8',
+        )
+        (self.shim / 'su').write_text(
+            textwrap.dedent("""\
+                #!/bin/sh
+                # su -s /bin/sh USER -c CMD
+                cmd=''
+                while [ "$#" -gt 0 ]; do
+                    case "$1" in
+                        -c) cmd=$2; shift 2 ;;
+                        *) shift ;;
+                    esac
+                done
+                exec /bin/sh -c "$cmd"
+                """),
+            encoding='utf-8',
+        )
+        for name in ('stat', 'chown', 'chmod', 'runuser', 'su'):
+            (self.shim / name).chmod(0o755)
+
+    def install_env(self):
+        env = os.environ.copy()
+        env['PREFIX'] = str(self.prefix)
+        env['FAKE_ROOT'] = str(self.root)
+        env['CALLS'] = str(self.calls)
+        env['STATE'] = str(self.state)
+        env['SUDO_USER'] = 'root'
+        env['PATH'] = f"{self.shim}:{env.get('PATH', '')}"
+        # Make uv cache writable in constrained envs.
+        env.setdefault('UV_CACHE_DIR', str(self.tmp / 'uv-cache'))
+        return env
+
+    def run_install(self, *args, fail_at: str | None = None, timeout: int = 300):
+        env = self.install_env()
+        if fail_at:
+            env['FAIL_AT'] = fail_at
+            self._install_failure_shims()
+        cmd = [
+            'unshare', '--user', '--map-root-user', '--mount', '--propagation', 'private',
+            'sh', '-c',
+            'set -eu; '
+            'mount --bind "$SHIM/stat" /usr/bin/stat; '
+            'mount --bind "$SHIM/chown" /usr/bin/chown; '
+            'mount --bind "$SHIM/chmod" /usr/bin/chmod; '
+            'mount --bind "$SHIM/runuser" /usr/sbin/runuser; '
+            'mount --bind "$SHIM/su" /usr/bin/su; '
+            'shift; exec sh "$INSTALL_SH" "$@"',
+            'sh', str(INSTALL_SH), *args,
+        ]
+        env['SHIM'] = str(self.shim)
+        env['INSTALL_SH'] = str(INSTALL_SH)
+        return subprocess.run(cmd, capture_output=True, text=True, check=False, env=env,
+                              cwd=str(REPO_ROOT), timeout=timeout)
+
+    def _install_failure_shims(self):
+        # These wrappers delegate to the real tool unless FAIL_AT matches.
+        real_uv = shutil.which('uv', path='/usr/bin:/bin:/usr/sbin:/sbin')
+        real_python = sys.executable
+        (self.shim / 'uv').write_text(
+            textwrap.dedent(f"""\
+                #!/bin/sh
+                real={real_uv!s}
+                case "${{FAIL_AT:-}}:$*" in
+                    uv-build:*build*--wheel*) echo "forced failure: uv build" >&2; exit 91 ;;
+                    uv-export:*export*requirements-txt*) echo "forced failure: uv export" >&2; exit 92 ;;
+                    uv-venv:*venv*--clear*) echo "forced failure: uv venv" >&2; exit 93 ;;
+                    uv-pip-deps:*pip*install*--require-hashes*) echo "forced failure: uv pip deps" >&2; exit 94 ;;
+                    uv-pip-wheel:*pip*install*--no-deps*agent_isolation*.whl*) echo "forced failure: uv pip wheel" >&2; exit 95 ;;
+                    uv-pip-wheel:*pip*install*--no-deps*.whl*) echo "forced failure: uv pip wheel" >&2; exit 95 ;;
+                esac
+                if [ "${{FAIL_AT:-}}" = uv-build-slow ] && echo "$*" | grep -q "build.*--wheel"; then
+                    sleep 30
+                fi
+                exec "$real" "$@"
+                """),
+            encoding='utf-8',
+        )
+        (self.shim / 'python3').write_text(
+            textwrap.dedent(f"""\
+                #!/bin/sh
+                real={real_python!s}
+                case "${{FAIL_AT:-}}:$*" in
+                    extract-requirements:*-*requirements.yml*) echo "forced failure: extract requirements" >&2; exit 96 ;;
+                esac
+                exec "$real" "$@"
+                """),
+            encoding='utf-8',
+        )
+        # ansible-galaxy shim: used during verification as the installed binary.
+        (self.shim / 'fail-galaxy').write_text(
+            "#!/bin/sh\necho 'forced failure: ansible-galaxy' >&2\nexit 97\n",
+            encoding='utf-8',
+        )
+        for name in ('uv', 'python3', 'fail-galaxy'):
+            (self.shim / name).chmod(0o755)
+
+    def install_fake_existing(self, content: str = 'old-install'):
+        if self.lib.exists() or self.lib.is_symlink():
+            if self.lib.is_dir() and not self.lib.is_symlink():
+                shutil.rmtree(self.lib)
+            else:
+                self.lib.unlink()
+        self.lib.mkdir(parents=True)
+        (self.lib / 'agent-isolation').mkdir()
+        (self.lib / 'agent-isolation' / 'marker.txt').write_text(content, encoding='utf-8')
+        (self.lib / 'collections').mkdir()
+        return self.lib
+
+
+class InstallScriptIntegrationTest(unittest.TestCase):
+    """Executable integration tests for the real install.sh lifecycle."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix='aa-install-int-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.harness = InstallLifecycleHarness(self.tmp)
+
+    def _skip_if_no_userns(self):
+        probe = subprocess.run(
+            ['unshare', '--user', '--map-root-user', 'sh', '-c', 'exit 0'],
+            capture_output=True, text=True, check=False,
+        )
+        if probe.returncode != 0:
+            self.skipTest('unprivileged user namespaces unavailable')
+
+    def test_fresh_install_creates_expected_layout(self):
+        self._skip_if_no_userns()
+        result = self.harness.run_install()
+        self.assertEqual(0, result.returncode, msg=result.stdout + '\n' + result.stderr)
+        self.assertTrue(self.harness.lib.is_dir())
+        self.assertTrue((self.harness.lib / 'agent-isolation' / 'bin' / 'python').exists())
+        self.assertTrue((self.harness.lib / 'collections' / 'ansible_collections' / 'ansible' / 'posix').is_dir())
+        self.assertTrue(self.harness.bin.is_symlink())
+        self.assertEqual(
+            os.path.realpath(self.harness.bin),
+            os.path.realpath(self.harness.lib / 'agent-isolation' / 'bin' / 'agent-account'),
+        )
+
+    def test_upgrade_preserves_backup_on_failure_and_restores(self):
+        self._skip_if_no_userns()
+        self.harness.install_fake_existing('previous')
+        result = self.harness.run_install(fail_at='uv-pip-wheel')
+        self.assertNotEqual(0, result.returncode)
+        self.assertTrue(self.harness.lib.is_dir())
+        self.assertEqual('previous', (self.harness.lib / 'agent-isolation' / 'marker.txt').read_text(encoding='utf-8'))
+
+    def test_uninstall_removes_installed_paths(self):
+        self._skip_if_no_userns()
+        self.harness.install_fake_existing()
+        self.harness.bin.symlink_to(self.harness.lib / 'agent-isolation' / 'bin' / 'agent-account')
+        result = self.harness.run_install('--uninstall')
+        self.assertEqual(0, result.returncode, msg=result.stdout + '\n' + result.stderr)
+        self.assertFalse(self.harness.lib.exists())
+        self.assertFalse(self.harness.bin.exists())
+
+    def test_failed_first_install_leaves_no_partial_lib(self):
+        self._skip_if_no_userns()
+        result = self.harness.run_install(fail_at='uv-build')
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(self.harness.lib.exists())
+
+    def test_pre_install_failure_after_lib_creation_leaves_no_lib_on_first_install(self):
+        self._skip_if_no_userns()
+        # FAIL_AT=mktemp-work: make mktemp fail so WORK creation fails after trap+LIB creation.
+        env = self.harness.install_env()
+        shim = self.harness.shim
+        real_mktemp = shutil.which('mktemp', path='/usr/bin:/bin')
+        (shim / 'mktemp').write_text(
+            f"#!/bin/sh\nif [ \"${{FAIL_AT:-}}\" = mktemp-work ]; then echo forced >&2; exit 98; fi\nexec {real_mktemp} \"$@\"\n",
+            encoding='utf-8',
+        )
+        (shim / 'mktemp').chmod(0o755)
+        cmd = [
+            'unshare', '--user', '--map-root-user', '--mount', '--propagation', 'private',
+            'sh', '-c',
+            'set -eu; '
+            'mount --bind "$SHIM/stat" /usr/bin/stat; '
+            'mount --bind "$SHIM/chown" /usr/bin/chown; '
+            'mount --bind "$SHIM/chmod" /usr/bin/chmod; '
+            'mount --bind "$SHIM/runuser" /usr/sbin/runuser; '
+            'mount --bind "$SHIM/su" /usr/bin/su; '
+            'mount --bind "$SHIM/mktemp" /usr/bin/mktemp; '
+            'exec sh "$INSTALL_SH"',
+            'sh', str(INSTALL_SH),
+        ]
+        env['SHIM'] = str(shim)
+        env['INSTALL_SH'] = str(INSTALL_SH)
+        env['FAIL_AT'] = 'mktemp-work'
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env,
+                                cwd=str(REPO_ROOT), timeout=120)
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(self.harness.lib.exists(), 'fresh install left partial $LIB behind')
+
+    def test_existing_install_untouched_when_pre_install_step_fails(self):
+        self._skip_if_no_userns()
+        self.harness.install_fake_existing('keep-me')
+        env = self.harness.install_env()
+        shim = self.harness.shim
+        real_mktemp = shutil.which('mktemp', path='/usr/bin:/bin')
+        (shim / 'mktemp').write_text(
+            f"#!/bin/sh\nif [ \"${{FAIL_AT:-}}\" = mktemp-work ]; then echo forced >&2; exit 98; fi\nexec {real_mktemp} \"$@\"\n",
+            encoding='utf-8',
+        )
+        (shim / 'mktemp').chmod(0o755)
+        cmd = [
+            'unshare', '--user', '--map-root-user', '--mount', '--propagation', 'private',
+            'sh', '-c',
+            'set -eu; '
+            'mount --bind "$SHIM/stat" /usr/bin/stat; '
+            'mount --bind "$SHIM/chown" /usr/bin/chown; '
+            'mount --bind "$SHIM/chmod" /usr/bin/chmod; '
+            'mount --bind "$SHIM/runuser" /usr/sbin/runuser; '
+            'mount --bind "$SHIM/su" /usr/bin/su; '
+            'mount --bind "$SHIM/mktemp" /usr/bin/mktemp; '
+            'exec sh "$INSTALL_SH"',
+            'sh', str(INSTALL_SH),
+        ]
+        env['SHIM'] = str(shim)
+        env['INSTALL_SH'] = str(INSTALL_SH)
+        env['FAIL_AT'] = 'mktemp-work'
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env,
+                                cwd=str(REPO_ROOT), timeout=120)
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual('keep-me', (self.harness.lib / 'agent-isolation' / 'marker.txt').read_text(encoding='utf-8'))
+
+    def test_symlink_lib_is_refused(self):
+        self._skip_if_no_userns()
+        target = self.tmp / 'real-lib'
+        target.mkdir()
+        self.harness.lib.symlink_to(target)
+        result = self.harness.run_install()
+        self.assertNotEqual(0, result.returncode)
+        combined = result.stdout + result.stderr
+        self.assertIn('refusing to replace it', combined)
+
+    def test_failed_uv_export_refuses_without_mutating_existing_install(self):
+        self._skip_if_no_userns()
+        self.harness.install_fake_existing('keep-me')
+        result = self.harness.run_install(fail_at='uv-export')
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual('keep-me', (self.harness.lib / 'agent-isolation' / 'marker.txt').read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':
